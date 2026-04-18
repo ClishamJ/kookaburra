@@ -1,0 +1,15 @@
+[package]
+name = "kookaburra-pty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "PTY management for Kookaburra."
+
+[lints]
+workspace = true
+
+[dependencies]
+kookaburra-core = { path = "../kookaburra-core" }

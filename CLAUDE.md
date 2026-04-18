@@ -40,9 +40,9 @@ Checklist mirrors §8 of the spec. Tick items as they land. Sub-items that aren'
 
 ### Phase 0 — Repo bootstrap
 
-- [ ] `Cargo.toml` workspace root with member crates listed
-- [ ] `rust-toolchain.toml` pinning stable Rust
-- [ ] `.gitignore` (Rust + macOS + editor detritus)
+- [x] `Cargo.toml` workspace root with member crates listed
+- [x] `rust-toolchain.toml` pinning stable Rust
+- [x] `.gitignore` (Rust + macOS + editor detritus)
 - [x] `README.md` with logo at top
 - [x] `assets/logo/kookaburra.svg` in place (1-bit, white, crispEdges)
 - [ ] Raster derivatives: `kookaburra-{32,64,128,256,512}.png`
@@ -53,7 +53,7 @@ Checklist mirrors §8 of the spec. Tick items as they land. Sub-items that aren'
 
 ### Phase 1 — Single tile end-to-end
 
-- [ ] Crate skeletons: `kookaburra-{core,pty,render,ui,app}` compile empty
+- [x] Crate skeletons: `kookaburra-{core,pty,render,ui,app}` compile empty
 - [ ] `kookaburra-core::ids` — `WorkspaceId`, `TileId`, `PtyId` newtypes + generators
 - [ ] `kookaburra-core::state` — `AppState`, `Workspace`, `Tile` structs
 - [ ] `kookaburra-core::layout` — `Layout` enum + rect computation

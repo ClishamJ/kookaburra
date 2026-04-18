@@ -1,0 +1,22 @@
+[package]
+name = "kookaburra-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Kookaburra binary."
+
+[[bin]]
+name = "kookaburra"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+kookaburra-core = { path = "../kookaburra-core" }
+kookaburra-pty = { path = "../kookaburra-pty" }
+kookaburra-render = { path = "../kookaburra-render" }
+kookaburra-ui = { path = "../kookaburra-ui" }
