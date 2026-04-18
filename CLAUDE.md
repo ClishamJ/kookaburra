@@ -49,7 +49,7 @@ Checklist mirrors §8 of the spec. Tick items as they land. Sub-items that aren'
 - [ ] `kookaburra.icns` (macOS) via `iconutil`
 - [ ] `kookaburra.ico` (Windows)
 - [ ] `kookaburra-linux.png` (512px)
-- [ ] CI: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`
+- [x] CI: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`
 
 ### Phase 1 — Single tile end-to-end
 
