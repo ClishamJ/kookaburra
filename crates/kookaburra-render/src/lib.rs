@@ -1,1 +1,456 @@
-//! Rendering. Populated in the Phase 1 render slice.
+//! wgpu-backed terminal renderer.
+//!
+//! Phase 1 slice. Opens a wgpu surface against a winit `Window`, clears
+//! each frame to the theme background, and draws each terminal tile via
+//! our custom instanced-quad glyph pipeline (see `glyph_pipeline.rs`).
+//!
+//! Historical note: an earlier revision drew text through `glyphon`
+//! (`TextRenderer` + `TextAtlas` + `cosmic-text` layout). Keystroke
+//! latency profiles showed glyphon's per-frame shape/prepare was the
+//! dominant cost even after per-row dirty hashing — because a terminal
+//! grid doesn't need bidi, fallback fonts, or wrapping, we bypass the
+//! layout engine entirely and rasterize each codepoint on demand into a
+//! shared R8 atlas. Glyphon is still a dependency only because its
+//! `FontSystem` gives us font-file bytes for free.
+//!
+//! Egui strip, per-cell selection bg, and borders are deferred
+//! (§§3-5 of the spec).
+
+mod glyph_pipeline;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use glyph_pipeline::{GlyphPipeline, LoadedFont};
+use wgpu::{
+    CommandEncoderDescriptor, CompositeAlphaMode, DeviceDescriptor, Instance, InstanceDescriptor,
+    LoadOp, Operations, PresentMode, RenderPassColorAttachment, RenderPassDescriptor,
+    RequestAdapterOptions, SurfaceConfiguration, TextureFormat, TextureUsages,
+    TextureViewDescriptor,
+};
+use winit::window::Window;
+
+use kookaburra_core::config::{Rgba, Theme};
+use kookaburra_core::ids::TileId;
+use kookaburra_core::layout::Rect;
+use kookaburra_core::snapshot::{CellFlags, TileSnapshot};
+
+/// Per-frame render budget cap (60fps).
+pub const FRAME_BUDGET_MS: u64 = 16;
+
+/// Logical pixel width of a tile border.
+pub const TILE_BORDER_PX: f32 = 1.0;
+
+/// Multiplier applied to rgb channels of unfocused tiles' fg colors — a
+/// cheap "the inactive tile is dim" effect without a second render pass.
+/// Tuned visually against Tokyo Night on dark backgrounds.
+pub const UNFOCUSED_DIM: f32 = 0.55;
+
+/// One tile's worth of render input: where to draw, whether this tile
+/// should be rendered at full brightness, and optionally a fresh
+/// snapshot. If `update` is `None` the renderer reuses the previous
+/// snapshot for this tile.
+pub struct RenderTile {
+    pub tile_id: TileId,
+    pub rect: Rect,
+    pub focused: bool,
+    pub update: Option<TileSnapshot>,
+}
+
+/// Cell font metrics.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CellMetrics {
+    pub width: f32,
+    pub height: f32,
+    pub ascent: f32,
+    pub descent: f32,
+}
+
+impl CellMetrics {
+    /// Hard-coded fallback metrics so layout math doesn't divide by zero
+    /// when no renderer is available (unit tests, headless).
+    #[must_use]
+    pub fn fallback(font_size_px: f32) -> Self {
+        Self {
+            width: font_size_px * 0.6,
+            height: font_size_px * 1.25,
+            ascent: font_size_px,
+            descent: font_size_px * 0.25,
+        }
+    }
+}
+
+/// How many cells fit in a rect for the given metrics.
+#[must_use]
+pub fn cells_in_rect(rect: Rect, metrics: CellMetrics) -> (u16, u16) {
+    let cols = (rect.width / metrics.width).floor().max(1.0);
+    let rows = (rect.height / metrics.height).floor().max(1.0);
+    (cols as u16, rows as u16)
+}
+
+/// Resolve an indexed ANSI color against a theme.
+#[must_use]
+pub fn ansi_color(theme: &Theme, idx: u8) -> Rgba {
+    theme.ansi[(idx as usize).min(15)]
+}
+
+/// wgpu-backed renderer.
+pub struct Renderer {
+    pub theme: Theme,
+    pub metrics: CellMetrics,
+    pub font_size_px: f32,
+    pub line_height_px: f32,
+
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    surface: wgpu::Surface<'static>,
+    surface_config: SurfaceConfiguration,
+
+    /// Kept around so we can rebuild `LoadedFont` on font or scale-factor
+    /// changes. Not used on the live draw path.
+    #[allow(dead_code)]
+    font_system: glyphon::FontSystem,
+    pipeline: GlyphPipeline,
+
+    /// Cached per-tile snapshot so tiles whose `update` is `None` can
+    /// still be drawn this frame (they don't change, but every frame
+    /// re-emits every visible tile's instances).
+    snapshots: HashMap<TileId, TileSnapshot>,
+
+    // Keep window alive for the lifetime of the surface. Dropping this
+    // after the surface drops is important on some platforms.
+    _window: Arc<Window>,
+}
+
+impl Renderer {
+    /// Construct a renderer bound to the given window. Synchronous — uses
+    /// `pollster` to drive the async adapter/device init.
+    pub fn new(window: Arc<Window>, theme: Theme, font_size_px: f32) -> Self {
+        pollster::block_on(Self::new_async(window, theme, font_size_px))
+    }
+
+    async fn new_async(window: Arc<Window>, theme: Theme, font_size_px: f32) -> Self {
+        let size = window.inner_size();
+        let scale_factor = window.scale_factor() as f32;
+
+        let instance = Instance::new(InstanceDescriptor::default());
+        let surface = instance
+            .create_surface(window.clone())
+            .expect("create wgpu surface");
+
+        let adapter = instance
+            .request_adapter(&RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("request adapter");
+
+        let (device, queue) = adapter
+            .request_device(&DeviceDescriptor::default(), None)
+            .await
+            .expect("request device");
+
+        let swapchain_format = TextureFormat::Bgra8UnormSrgb;
+        let surface_caps = surface.get_capabilities(&adapter);
+        // Prefer Mailbox (non-blocking triple-buffer) for minimum keystroke
+        // latency — under `ControlFlow::Wait` each keystroke triggers one
+        // render; Fifo would block the main thread up to ~16ms waiting for
+        // vsync on every one. Fall back to Fifo if Mailbox isn't available.
+        let present_mode = if surface_caps.present_modes.contains(&PresentMode::Mailbox) {
+            PresentMode::Mailbox
+        } else {
+            PresentMode::Fifo
+        };
+        log::info!("wgpu surface present_mode={present_mode:?}");
+        let surface_config = SurfaceConfiguration {
+            usage: TextureUsages::RENDER_ATTACHMENT,
+            format: swapchain_format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode,
+            alpha_mode: CompositeAlphaMode::Opaque,
+            view_formats: vec![],
+            // 1 frame latency — we render on demand, not continuously, so
+            // queueing more than one frame ahead just adds input lag.
+            desired_maximum_frame_latency: 1,
+        };
+        surface.configure(&device, &surface_config);
+
+        let mut font_system = glyphon::FontSystem::new();
+        let font = LoadedFont::from_font_system(&mut font_system, font_size_px)
+            .expect("no monospace font available on this system");
+        let metrics = CellMetrics {
+            width: font.cell_width,
+            height: font.cell_height,
+            ascent: font.ascent,
+            descent: font.descent,
+        };
+        let line_height_px = font.cell_height;
+        let pipeline = GlyphPipeline::new(&device, &queue, swapchain_format, font, scale_factor);
+
+        Self {
+            theme,
+            metrics,
+            font_size_px,
+            line_height_px,
+            device,
+            queue,
+            surface,
+            surface_config,
+            font_system,
+            pipeline,
+            snapshots: HashMap::new(),
+            _window: window,
+        }
+    }
+
+    /// Reconfigure the surface to a new physical pixel size.
+    pub fn resize(&mut self, new_size: (u32, u32)) {
+        let (w, h) = new_size;
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.surface_config.width = w;
+        self.surface_config.height = h;
+        self.surface.configure(&self.device, &self.surface_config);
+    }
+
+    /// Current surface size in physical pixels.
+    #[must_use]
+    pub fn size(&self) -> (u32, u32) {
+        (self.surface_config.width, self.surface_config.height)
+    }
+
+    /// Draw a frame. Clears to theme background, then emits every
+    /// visible tile's bg+fg quads into the shared pipeline and issues
+    /// up to two draw calls total.
+    pub fn render_frame(&mut self, tiles: &[RenderTile]) {
+        // Update per-tile snapshot cache with any fresh snapshots.
+        for t in tiles {
+            if let Some(snap) = t.update.as_ref() {
+                self.snapshots.insert(t.tile_id, snap.clone());
+            }
+        }
+
+        let frame = match self.surface.get_current_texture() {
+            Ok(f) => f,
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                self.surface.configure(&self.device, &self.surface_config);
+                return;
+            }
+            Err(e) => {
+                log::warn!("surface acquire failed: {e:?}");
+                return;
+            }
+        };
+        let view = frame.texture.create_view(&TextureViewDescriptor::default());
+
+        // Rebuild instance lists from scratch. Without layout/shaping, this
+        // is just byte arithmetic per cell — <0.1ms even for a dense 6×2
+        // grid at 4K.
+        self.pipeline.clear_instances();
+        for t in tiles {
+            if let Some(snap) = self.snapshots.get(&t.tile_id) {
+                Self::emit_tile(
+                    &mut self.pipeline,
+                    &self.queue,
+                    &self.theme,
+                    self.metrics,
+                    snap,
+                    t.rect,
+                    t.focused,
+                );
+            }
+        }
+
+        let clear = rgba_to_wgpu_color(self.theme.background);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("kookaburra-frame"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("kookaburra-main-pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(clear),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            let size = (self.surface_config.width, self.surface_config.height);
+            self.pipeline
+                .render(&self.device, &self.queue, &mut pass, size);
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
+    }
+
+    /// Drop the cached snapshot for a tile (call when the tile closes).
+    pub fn drop_tile(&mut self, tile_id: TileId) {
+        self.snapshots.remove(&tile_id);
+    }
+
+    /// Walk every cell in `snap` and push the bg+fg instances needed to
+    /// draw it at `rect`. Takes `&mut pipeline` + `&queue` as disjoint
+    /// borrows so the caller can hold them both.
+    fn emit_tile(
+        pipeline: &mut GlyphPipeline,
+        queue: &wgpu::Queue,
+        theme: &Theme,
+        metrics: CellMetrics,
+        snap: &TileSnapshot,
+        rect: Rect,
+        focused: bool,
+    ) {
+        if snap.cols == 0 || snap.rows == 0 || snap.cells.is_empty() {
+            return;
+        }
+        let dim = if focused { 1.0 } else { UNFOCUSED_DIM };
+        let cursor = if focused { snap.cursor } else { None };
+        let cw = metrics.width;
+        let ch = metrics.height;
+        let ascent = metrics.ascent;
+        let bg_default = theme.background;
+        let cols = snap.cols as usize;
+        let rows = snap.rows as usize;
+
+        for row in 0..rows {
+            let row_start = row * cols;
+            let cy = rect.y + row as f32 * ch;
+            let by = cy + ascent;
+            for col in 0..cols {
+                let cell = &snap.cells[row_start + col];
+                let cx = rect.x + col as f32 * cw;
+
+                let is_cursor = matches!(
+                    cursor,
+                    Some((cc, cr)) if cc as usize == col && cr as usize == row
+                );
+
+                // --- bg pass ---
+                // Inverse video flips fg/bg for this cell.
+                let inverse = cell.flags.contains(CellFlags::INVERSE);
+                let (mut cell_fg, mut cell_bg) = if inverse {
+                    (cell.bg, cell.fg)
+                } else {
+                    (cell.fg, cell.bg)
+                };
+                // Empty/zero bg means "default" — don't push a quad for
+                // the common case of all-default backgrounds.
+                if cell_bg.a == 0 {
+                    cell_bg = bg_default;
+                }
+
+                if is_cursor {
+                    // Cursor owns the bg; glyph fg swaps to theme.background
+                    // so the char is legible over the cursor block.
+                    pipeline.push_bg(cx, cy, cw, ch, theme.cursor);
+                    cell_fg = theme.background;
+                } else if cell_bg != bg_default {
+                    let bg = if dim < 1.0 {
+                        dim_rgba(cell_bg, dim)
+                    } else {
+                        cell_bg
+                    };
+                    pipeline.push_bg(cx, cy, cw, ch, bg);
+                }
+
+                // --- fg pass ---
+                if cell.flags.contains(CellFlags::HIDDEN) {
+                    continue;
+                }
+                let glyph = if cell.ch == '\0' { ' ' } else { cell.ch };
+                if glyph == ' ' {
+                    continue;
+                }
+                let fg = if dim < 1.0 {
+                    dim_rgba(cell_fg, dim)
+                } else {
+                    cell_fg
+                };
+                pipeline.push_fg(glyph, cx, by, fg, queue);
+            }
+        }
+    }
+}
+
+fn dim_rgba(c: Rgba, factor: f32) -> Rgba {
+    Rgba {
+        r: ((c.r as f32) * factor).round().clamp(0.0, 255.0) as u8,
+        g: ((c.g as f32) * factor).round().clamp(0.0, 255.0) as u8,
+        b: ((c.b as f32) * factor).round().clamp(0.0, 255.0) as u8,
+        a: c.a,
+    }
+}
+
+fn rgba_to_wgpu_color(c: Rgba) -> wgpu::Color {
+    wgpu::Color {
+        r: srgb_to_linear(c.r),
+        g: srgb_to_linear(c.g),
+        b: srgb_to_linear(c.b),
+        a: f64::from(c.a) / 255.0,
+    }
+}
+
+fn srgb_to_linear(c: u8) -> f64 {
+    let s = f64::from(c) / 255.0;
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cells_in_rect_floors_to_at_least_one_cell() {
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        let (c, r) = cells_in_rect(rect, CellMetrics::fallback(14.0));
+        assert!(c >= 1);
+        assert!(r >= 1);
+    }
+
+    #[test]
+    fn cells_in_rect_partitions_a_simple_grid() {
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+        };
+        let metrics = CellMetrics {
+            width: 8.0,
+            height: 16.0,
+            ascent: 14.0,
+            descent: 2.0,
+        };
+        let (c, r) = cells_in_rect(rect, metrics);
+        assert_eq!(c, 100);
+        assert_eq!(r, 37); // 600 / 16 = 37.5 → 37
+    }
+
+    #[test]
+    fn cell_metrics_fallback_nonzero() {
+        let m = CellMetrics::fallback(14.0);
+        assert!(m.width > 0.0);
+        assert!(m.height > 0.0);
+    }
+}

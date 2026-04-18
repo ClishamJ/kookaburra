@@ -55,34 +55,36 @@ Checklist mirrors §8 of the spec. Tick items as they land. Sub-items that aren'
 
 - [x] Crate skeletons: `kookaburra-{core,pty,render,ui,app}` compile empty
 - [x] `kookaburra-core::ids` — `WorkspaceId`, `TileId`, `PtyId` newtypes + generators
-- [ ] `kookaburra-core::state` — `AppState`, `Workspace`, `Tile` structs
+- [x] `kookaburra-core::state` — `AppState`, `Workspace`, `Tile` structs
 - [x] `kookaburra-core::layout` — `Layout` enum + rect computation
-- [ ] `kookaburra-core::action` — `Action` enum
-- [ ] `kookaburra-core::config` — `Config` stub
-- [ ] `kookaburra-core::worktree` — `Worktree` types (no impl yet)
+- [x] `kookaburra-core::action` — `Action` enum + `apply_action` + `PtySideEffects`
+- [x] `kookaburra-core::config` — `Config`, `Theme`, `FontConfig`, Tokyo Night palette
+- [x] `kookaburra-core::worktree` — `Worktree`, `WorktreeStatus`, `WorktreeConfig` types (no impl yet)
+- [x] `kookaburra-core::snapshot` — `TileSnapshot`, `RenderCell`, `CellFlags`, `CursorStyle`
 - [x] Unit tests: layout rect math for 1×1, 2×1, 1×2, 2×2, 3×2, 2×3
 - [x] Unit tests: ID uniqueness
-- [ ] Unit tests: basic `AppState` construction + tile insert/remove
-- [ ] `kookaburra-pty`: spawn a PTY via `portable-pty`, read bytes, verify with stdout dump
-- [ ] Wire `alacritty_terminal::Term` + parser; log grid on change
-- [ ] `EventProxy` impl of `EventListener` forwarding to `mpsc`
-- [ ] `kookaburra-render`: wgpu init, surface, single tile glyphon text + cursor + bg
-- [ ] `CellMetrics` computed from 'M'/'0' at startup and on font change
-- [ ] Color resolution: named / spec / indexed → theme palette (Tokyo Night default)
-- [ ] Keyboard input → PTY writer
-- [ ] Window resize → surface resize → PTY `TIOCSWINSZ` → `Term` grid resize (in that order, sync, main thread)
-- [ ] **Exit criterion:** open app, run `vim` / `htop` in a single tile, it works
+- [x] Unit tests: basic `AppState` construction + tile insert/remove
+- [x] Unit tests: `apply_action` against a `StubPty` (create / close / move / zen / delete)
+- [x] `kookaburra-pty`: spawn a PTY via `portable-pty`, bytes pumped through alacritty `Term` on a reader thread
+- [x] Wire `alacritty_terminal::Term` + parser (`vte::ansi::Processor<StdSyncHandler>`) behind `Arc<FairMutex<_>>`
+- [x] `EventProxy` impl of `EventListener` forwarding Title/ResetTitle/Bell/Exit/ChildExit to `mpsc`
+- [x] `kookaburra-render`: wgpu surface (Metal/Bgra8UnormSrgb) + glyphon text rendering wired up
+- [x] `CellMetrics::fallback` so layout math doesn't divide by zero
+- [x] Color resolution helper: indexed → theme palette (Tokyo Night default)
+- [x] Keyboard input → PTY writer (winit `KeyEvent` → bytes, handles Ctrl/Alt/named keys + CSI sequences)
+- [x] Window resize → surface resize → PTY `TIOCSWINSZ` → `Term` grid resize (synchronous, main thread, in order)
+- [~] **Exit criterion:** binary boots, opens window, wgpu+glyphon init clean; interactive vim/htop check still pending live user verification
 
 ### Phase 2 — Multi-tile and layouts
 
-- [ ] N tiles rendered from layout enum
-- [ ] Focus model + keyboard focus switching (`Cmd+Opt+1..6`)
-- [ ] Per-tile PTY resize on window resize
-- [ ] Mouse click-to-focus
-- [ ] Tile borders + focused-tile accent
-- [ ] Inactive tile dimming (~10–15% opacity reduction)
-- [ ] Layout preset switching via keybinding
-- [ ] **Exit criterion:** 3×2 grid, click/keyboard focus, borders indicate focus
+- [x] N tiles rendered from layout enum
+- [x] Focus model + keyboard focus switching (`Cmd+Opt+1..6`)
+- [x] Per-tile PTY resize on window resize (each tile's rect → its own TIOCSWINSZ)
+- [x] Mouse click-to-focus
+- [~] Tile borders + focused-tile accent — no explicit quad border yet; focus is indicated by the `UNFOCUSED_DIM` mix on inactive tiles. A proper 1px outline needs a wgpu quad pipeline (deferred).
+- [x] Inactive tile dimming (~45% fg reduction via `UNFOCUSED_DIM`)
+- [x] Layout preset switching via keybinding (`Cmd+G` cycles 1×1 → 2×1 → 2×2 → 3×2)
+- [~] **Exit criterion:** 3×2 grid lives; click + `Cmd+Opt+N` focus works; borders not drawn, focus-via-dim stands in.
 
 ### Phase 3 — Strip and workspaces
 
@@ -90,7 +92,7 @@ Checklist mirrors §8 of the spec. Tick items as they land. Sub-items that aren'
 - [ ] Event routing: egui first → focused tile → terminal mouse → main loop; respect `wants_keyboard_input` / `wants_pointer_input`
 - [ ] Blank `TopBottomPanel` strip (56px, logo 24×24 top-left)
 - [ ] Cards (~140×48) with labels + active highlight + click-to-switch
-- [ ] Multi-workspace state + `Cmd+1..9` keybinds
+- [x] Multi-workspace state + `Cmd+1..9` keybinds (switch) + `Cmd+N` (new)
 - [ ] Mini tile-activity indicators on cards
 - [ ] "Claude is generating" subtle signal on cards
 - [ ] Workspace rename inline (double-click label, `Cmd+L`)
@@ -99,21 +101,25 @@ Checklist mirrors §8 of the spec. Tick items as they land. Sub-items that aren'
 - [ ] Drag tile onto empty strip → new workspace containing that tile
 - [ ] `+` button to add workspace; close-workspace path
 - [ ] Horizontal scroll when strip overflows
-- [ ] **Exit criterion:** multiple workspaces, visual strip, tile drag between workspaces works
+- [~] **Exit criterion:** multi-workspace model exists + keyboard switching;
+      visible strip + drag interaction still pending egui integration
 
 ### Phase 4 — Terminal UX essentials
 
-- [ ] Mouse text selection (single, word on double-click, line on triple-click)
+- [ ] Mouse text selection (single, word on double-click, line on triple-click) — blocked on bg-quad pipeline for visible highlight
 - [ ] Selection wrapping semantics across soft-wrapped lines
 - [ ] Selection into scrollback
 - [ ] Rectangular selection
-- [ ] Clipboard copy/paste via `arboard`
+- [~] Clipboard copy/paste via `arboard` — paste done (bracketed-paste);
+      `Cmd+C` copies the visible grid (stand-in until drag-selection lands)
 - [ ] OSC 52 clipboard request → `arboard`
-- [ ] `Cmd+C` / `Cmd+V` semantics (passthrough when no selection)
-- [ ] Scrollback: mouse wheel + keyboard
+- [~] `Cmd+C` / `Cmd+V` semantics — Cmd+V bracketed-paste; Cmd+C copies
+      visible grid; selection-aware passthrough pending drag-selection
+- [x] Scrollback: mouse wheel (keyboard TBD alongside in-tile search)
+- [x] Cursor rendering (fg-color swap on cursor cell; `theme.cursor`)
 - [ ] `Cmd+F` in-tile search via `alacritty_terminal::RegexSearch`
 - [ ] Bell handling + visual indicator
-- [ ] OSC title changes → `Tile::title`
+- [x] OSC title changes → `Tile::title` (wired via `EventProxy`)
 - [ ] OSC hyperlinks (render + click)
 - [ ] New-output highlight (the "unread" edge pulse)
 
@@ -126,7 +132,7 @@ Checklist mirrors §8 of the spec. Tick items as they land. Sub-items that aren'
 - [ ] Builtin themes: Tokyo Night, Catppuccin Mocha, Solarized Dark
 - [ ] Font configuration + live switching
 - [ ] Background font enumeration on startup (keep cold start fast)
-- [ ] `Cmd+Enter` zen mode (maximize focused tile, hide strip)
+- [x] `Cmd+Enter` zen mode (maximize focused tile; strip not drawn yet)
 - [ ] Output-aware dimming tuned
 - [ ] Frame-budget cap (60fps under pathological load)
 

@@ -10,3 +10,6 @@ description = "Domain types for Kookaburra — IDs, state, layout, actions."
 
 [lints]
 workspace = true
+
+[dependencies]
+bitflags = "2"

@@ -13,3 +13,16 @@ workspace = true
 
 [dependencies]
 kookaburra-core = { path = "../kookaburra-core" }
+wgpu = "22.1"
+winit = "0.30"
+# Glyphon still pulls in FontSystem/fontdb for font discovery, but the
+# live draw path (TextRenderer + TextAtlas + layout) is now replaced by
+# our own instanced-quad glyph pipeline (see `glyph_pipeline.rs`).
+glyphon = "0.6"
+pollster = "0.4"
+log = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+# Direct font rasterization + atlas packing — bypasses cosmic-text's
+# layout engine entirely for the monospace terminal hot path.
+swash = "0.1"
+etagere = "0.2"

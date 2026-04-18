@@ -20,3 +20,12 @@ kookaburra-core = { path = "../kookaburra-core" }
 kookaburra-pty = { path = "../kookaburra-pty" }
 kookaburra-render = { path = "../kookaburra-render" }
 kookaburra-ui = { path = "../kookaburra-ui" }
+log = "0.4"
+env_logger = "0.11"
+winit = "0.30"
+pollster = "0.4"
+portable-pty = "0.8"
+# `default-features = false` drops arboard's image-data support — we
+# only paste text, and `image`/`tiff`/`png` transitively blow the target
+# dir past the free-disk budget on this dev machine.
+arboard = { version = "3", default-features = false }

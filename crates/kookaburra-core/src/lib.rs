@@ -7,5 +7,6 @@ pub mod action;
 pub mod config;
 pub mod ids;
 pub mod layout;
+pub mod snapshot;
 pub mod state;
 pub mod worktree;
