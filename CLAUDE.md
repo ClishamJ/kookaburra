@@ -88,21 +88,20 @@ Checklist mirrors §8 of the spec. Tick items as they land. Sub-items that aren'
 
 ### Phase 3 — Strip and workspaces
 
-- [ ] egui integration in render pipeline (`egui-wgpu` + `egui-winit`)
-- [ ] Event routing: egui first → focused tile → terminal mouse → main loop; respect `wants_keyboard_input` / `wants_pointer_input`
-- [ ] Blank `TopBottomPanel` strip (56px, logo 24×24 top-left)
-- [ ] Cards (~140×48) with labels + active highlight + click-to-switch
+- [x] egui integration in render pipeline (`egui-wgpu` + `egui-winit`)
+- [x] Event routing: egui first → focused tile → terminal mouse → main loop; respect `wants_keyboard_input` / `wants_pointer_input`
+- [x] Blank `TopBottomPanel` strip (56px, logo 24×24 top-left)
+- [x] Cards (~140×48) with labels + active highlight + click-to-switch
 - [x] Multi-workspace state + `Cmd+1..9` keybinds (switch) + `Cmd+N` (new)
-- [ ] Mini tile-activity indicators on cards
-- [ ] "Claude is generating" subtle signal on cards
-- [ ] Workspace rename inline (double-click label, `Cmd+L`)
-- [ ] Drag to reorder workspaces
-- [ ] Drag tile onto card → `Action::MoveTile` (the signature interaction)
-- [ ] Drag tile onto empty strip → new workspace containing that tile
-- [ ] `+` button to add workspace; close-workspace path
-- [ ] Horizontal scroll when strip overflows
-- [~] **Exit criterion:** multi-workspace model exists + keyboard switching;
-      visible strip + drag interaction still pending egui integration
+- [x] Mini tile-activity indicators on cards — tile count in corner, plus a breathing accent "unread" dot on inactive cards when any tile has `has_new_output` (alpha pulses via a 1.6 s sine)
+- [x] "Claude is generating" subtle signal on cards — three-dot accent marker in the card corner when any tile emitted bytes in the last 600 ms (rough stand-in until a Claude-specific stream detector ships)
+- [x] Workspace rename inline (double-click label, `Cmd+L`) — double-click or `Cmd+L` flips the card into a `TextEdit`; Enter commits, Esc cancels.
+- [x] Drag to reorder workspaces — left-drag a card; an accent bar shows the drop slot, release fires `Action::ReorderWorkspaces`. Plain click on the card still switches to it.
+- [x] Drag tile onto card → `Action::MoveTile` (the signature interaction) — plain left-drag (after a 6 px threshold) or Cmd+left-drag a tile onto a card fires `MoveTile`; a ghost pill follows the cursor while the drag is in flight. No-op when dropping on the tile's own workspace.
+- [x] Drag tile onto empty strip → new workspace containing that tile (`Action::MoveTileToNewWorkspace`; fires when the drag lands inside the strip but outside every card)
+- [x] `+` button to add workspace; close-workspace path (middle-click card → `Action::DeleteWorkspace`; last workspace auto-reseeds via `apply_action`)
+- [x] Horizontal scroll when strip overflows
+- [x] **Exit criterion:** strip + cards render in egui, drag-to-card, drag-to-reorder, inline rename, close-workspace, generating/activity indicators all wired; Cmd+1..9 / Cmd+N / Cmd+L shortcuts in.
 
 ### Phase 4 — Terminal UX essentials
 

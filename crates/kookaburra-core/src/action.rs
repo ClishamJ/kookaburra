@@ -50,6 +50,12 @@ pub enum Action {
         tile_id: TileId,
         target_workspace: WorkspaceId,
     },
+    /// Spin a tile out into its own new workspace, then focus the new
+    /// workspace. Emitted when the user drags a tile onto the strip
+    /// outside any existing card (spec §3 "drag tile onto empty strip").
+    MoveTileToNewWorkspace {
+        tile_id: TileId,
+    },
     SetPrimaryTile {
         workspace: WorkspaceId,
         tile: TileId,
@@ -203,6 +209,25 @@ pub fn apply_action(state: &mut AppState, pty: &mut dyn PtySideEffects, action: 
                 ws.push_tile(tile);
             }
         }
+        Action::MoveTileToNewWorkspace { tile_id } => {
+            // Extract the tile from whichever workspace holds it.
+            let mut extracted: Option<Tile> = None;
+            for ws in state.workspaces.iter_mut() {
+                if ws.tile(tile_id).is_some() {
+                    extracted = ws.remove_tile(tile_id);
+                    break;
+                }
+            }
+            if let Some(tile) = extracted {
+                let idx = state.workspaces.len() + 1;
+                let mut ws = Workspace::new(format!("workspace {idx}"));
+                let new_ws_id = ws.id;
+                ws.push_tile(tile);
+                state.workspaces.push(ws);
+                state.active_workspace = new_ws_id;
+                state.focused_tile = Some(tile_id);
+            }
+        }
         Action::SetPrimaryTile { workspace, tile } => {
             if let Some(ws) = state.workspace_mut(workspace) {
                 if ws.tile(tile).is_some() {
@@ -346,6 +371,35 @@ mod tests {
         let only = state.active_workspace;
         apply_action(&mut state, &mut pty, Action::DeleteWorkspace(only));
         assert_eq!(state.workspaces.len(), 1);
+    }
+
+    #[test]
+    fn move_tile_to_new_workspace_creates_and_switches() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let source = state.active_workspace;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::CreateTile {
+                workspace: source,
+                worktree: None,
+            },
+        );
+        let tile_id = state.active_workspace().tiles[0].id;
+        let before = state.workspaces.len();
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::MoveTileToNewWorkspace { tile_id },
+        );
+        assert_eq!(state.workspaces.len(), before + 1);
+        assert_eq!(state.active_workspace().tiles.len(), 1);
+        assert_eq!(state.active_workspace().tiles[0].id, tile_id);
+        assert_ne!(state.active_workspace, source);
+        assert_eq!(state.focused_tile, Some(tile_id));
+        // Source workspace is now empty.
+        assert!(state.workspace(source).unwrap().tiles.is_empty());
     }
 
     #[test]

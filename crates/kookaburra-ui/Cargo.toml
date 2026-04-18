@@ -13,3 +13,9 @@ workspace = true
 
 [dependencies]
 kookaburra-core = { path = "../kookaburra-core" }
+# egui 0.29 matches wgpu 22 (the rest of the render stack). egui-winit
+# 0.29 expects winit 0.30, which the app already uses.
+egui = "0.29"
+egui-winit = { version = "0.29", default-features = false, features = ["links"] }
+winit = "0.30"
+log = "0.4"

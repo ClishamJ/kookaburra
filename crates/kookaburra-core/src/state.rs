@@ -7,6 +7,7 @@
 //! the alacritty_terminal dependency (see NOTES.md).
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::config::Config;
 use crate::ids::{PtyId, TileId, WorkspaceId};
@@ -175,6 +176,12 @@ pub struct Tile {
     pub worktree: Option<Worktree>,
     /// Whether the user has rung the bell since we last drew.
     pub bell_pending: bool,
+    /// Wall-clock timestamp of the last PTY output batch, if any. Used by
+    /// the strip to render a "generating" / recent-activity signal on
+    /// workspace cards. Stays `None` for tiles that have never emitted
+    /// output. Not persisted — lost across restarts, which is correct for
+    /// a "what's active right now" hint.
+    pub last_output_at: Option<Instant>,
 }
 
 impl Tile {
@@ -201,6 +208,7 @@ impl Tile {
             cwd: None,
             worktree: None,
             bell_pending: false,
+            last_output_at: None,
         }
     }
 

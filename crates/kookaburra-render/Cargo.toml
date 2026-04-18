@@ -26,3 +26,8 @@ bytemuck = { version = "1", features = ["derive"] }
 # layout engine entirely for the monospace terminal hot path.
 swash = "0.1"
 etagere = "0.2"
+# Strip / cards / dialogs live in egui. The render crate owns the
+# `egui-wgpu::Renderer` so both passes (terminal glyphs + egui meshes)
+# land in the same wgpu command encoder.
+egui = "0.29"
+egui-wgpu = "0.29"

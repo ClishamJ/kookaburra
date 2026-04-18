@@ -13,14 +13,14 @@
 //! shared R8 atlas. Glyphon is still a dependency only because its
 //! `FontSystem` gives us font-file bytes for free.
 //!
-//! Egui strip, per-cell selection bg, and borders are deferred
-//! (§§3-5 of the spec).
+//! Per-cell selection bg and borders are deferred (§§4-5 of the spec).
 
 mod glyph_pipeline;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use egui_wgpu::{Renderer as EguiRenderer, ScreenDescriptor};
 use glyph_pipeline::{GlyphPipeline, LoadedFont};
 use wgpu::{
     CommandEncoderDescriptor, CompositeAlphaMode, DeviceDescriptor, Instance, InstanceDescriptor,
@@ -34,6 +34,16 @@ use kookaburra_core::config::{Rgba, Theme};
 use kookaburra_core::ids::TileId;
 use kookaburra_core::layout::Rect;
 use kookaburra_core::snapshot::{CellFlags, TileSnapshot};
+
+/// One frame's worth of tessellated egui geometry + texture deltas. Built
+/// by `kookaburra-ui` and ferried through here. Opaque to the render
+/// crate beyond the fields on the struct — we just hand them to
+/// `egui-wgpu`.
+pub struct UiFrame {
+    pub primitives: Vec<egui::ClippedPrimitive>,
+    pub textures_delta: egui::TexturesDelta,
+    pub pixels_per_point: f32,
+}
 
 /// Per-frame render budget cap (60fps).
 pub const FRAME_BUDGET_MS: u64 = 16;
@@ -111,6 +121,7 @@ pub struct Renderer {
     #[allow(dead_code)]
     font_system: glyphon::FontSystem,
     pipeline: GlyphPipeline,
+    egui_renderer: EguiRenderer,
 
     /// Cached per-tile snapshot so tiles whose `update` is `None` can
     /// still be drawn this frame (they don't change, but every frame
@@ -189,6 +200,9 @@ impl Renderer {
         };
         let line_height_px = font.cell_height;
         let pipeline = GlyphPipeline::new(&device, &queue, swapchain_format, font, scale_factor);
+        // egui-wgpu expects the same swapchain format + multisample state
+        // the pass uses. `msaa_samples: 1` matches our wgpu::MultisampleState::default().
+        let egui_renderer = EguiRenderer::new(&device, swapchain_format, None, 1, false);
 
         Self {
             theme,
@@ -201,6 +215,7 @@ impl Renderer {
             surface_config,
             font_system,
             pipeline,
+            egui_renderer,
             snapshots: HashMap::new(),
             _window: window,
         }
@@ -223,10 +238,10 @@ impl Renderer {
         (self.surface_config.width, self.surface_config.height)
     }
 
-    /// Draw a frame. Clears to theme background, then emits every
-    /// visible tile's bg+fg quads into the shared pipeline and issues
-    /// up to two draw calls total.
-    pub fn render_frame(&mut self, tiles: &[RenderTile]) {
+    /// Draw a frame. Clears to theme background, emits every visible
+    /// tile's bg+fg quads through the glyph pipeline, then draws the
+    /// egui strip (if a `UiFrame` is provided) into the same pass.
+    pub fn render_frame(&mut self, tiles: &[RenderTile], ui: Option<&UiFrame>) {
         // Update per-tile snapshot cache with any fresh snapshots.
         for t in tiles {
             if let Some(snap) = t.update.as_ref() {
@@ -271,6 +286,26 @@ impl Renderer {
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("kookaburra-frame"),
             });
+
+        // Upload egui texture deltas + vertex buffers outside the pass —
+        // `update_buffers` records copy commands onto the encoder.
+        let screen = ScreenDescriptor {
+            size_in_pixels: [self.surface_config.width, self.surface_config.height],
+            pixels_per_point: ui.map(|u| u.pixels_per_point).unwrap_or(1.0),
+        };
+        if let Some(ui) = ui {
+            for (id, delta) in &ui.textures_delta.set {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, *id, delta);
+            }
+            self.egui_renderer.update_buffers(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &ui.primitives,
+                &screen,
+            );
+        }
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("kookaburra-main-pass"),
@@ -289,6 +324,21 @@ impl Renderer {
             let size = (self.surface_config.width, self.surface_config.height);
             self.pipeline
                 .render(&self.device, &self.queue, &mut pass, size);
+
+            // `egui_wgpu::Renderer::render` wants a `RenderPass<'static>`.
+            // `forget_lifetime` drops the encoder-tied lifetime; safe here
+            // because the pass is still in-scope and we drop it below.
+            if let Some(ui) = ui {
+                let mut static_pass = pass.forget_lifetime();
+                self.egui_renderer
+                    .render(&mut static_pass, &ui.primitives, &screen);
+            }
+        }
+
+        if let Some(ui) = ui {
+            for id in &ui.textures_delta.free {
+                self.egui_renderer.free_texture(id);
+            }
         }
 
         self.queue.submit(Some(encoder.finish()));

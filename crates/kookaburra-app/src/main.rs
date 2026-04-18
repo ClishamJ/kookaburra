@@ -18,8 +18,8 @@ use kookaburra_core::state::AppState;
 use kookaburra_core::worktree::WorktreeConfig;
 
 use kookaburra_pty::{PtyEvent, PtyEventSink, PtyManager, SpawnRequest};
-use kookaburra_render::{cells_in_rect, RenderTile, Renderer};
-use kookaburra_ui::UiLayer;
+use kookaburra_render::{cells_in_rect, RenderTile, Renderer, UiFrame};
+use kookaburra_ui::{EventResponse, PreparedFrame, TileDragGhost, UiLayer, STRIP_HEIGHT};
 
 use portable_pty::PtySize;
 use winit::application::ApplicationHandler;
@@ -34,6 +34,19 @@ const DEFAULT_HEIGHT: u32 = 900;
 const STARTER_TILES: usize = 6;
 const TILE_GAP_PX: f32 = 6.0;
 const WINDOW_INSET_PX: f32 = 8.0;
+/// Pointer-drag threshold in physical pixels. Below this, a press/release
+/// is treated as a plain click (focus); above it, the gesture is promoted
+/// to a tile drag-to-card. Matches egui's own default threshold.
+const DRAG_THRESHOLD_PX: f64 = 6.0;
+
+/// A pending left-press on a tile. We defer the focus-vs-drag decision
+/// until the user either releases the button (→ focus) or moves past the
+/// threshold (→ drag).
+#[derive(Copy, Clone, Debug)]
+struct PressPending {
+    tile_id: TileId,
+    phys_pos: PhysicalPosition<f64>,
+}
 
 /// Sink the PTY reader threads emit into. Each call pushes the event onto
 /// the winit event loop, which wakes `ApplicationHandler::user_event`
@@ -83,7 +96,7 @@ struct App {
     config: Config,
     state: AppState,
     pty_manager: PtyManager,
-    ui: UiLayer,
+    ui: Option<UiLayer>,
     actions: Vec<Action>,
     render_scratch: Vec<RenderTile>,
     /// Tiles that need a fresh snapshot on the next frame. Tiles NOT in
@@ -98,6 +111,14 @@ struct App {
     last_rendered_focus: Option<TileId>,
     modifiers: ModifiersState,
     cursor_pos: PhysicalPosition<f64>,
+    /// When `Some`, the user is actively dragging a tile (either via a
+    /// Cmd+click or via a plain-click that crossed `DRAG_THRESHOLD_PX`).
+    /// On release the pointer is tested against workspace cards / strip
+    /// area to decide the drop target.
+    dragging_tile: Option<TileId>,
+    /// Plain left-press on a tile, waiting to find out whether the user
+    /// means to focus (quick release) or drag (cursor moves far enough).
+    press_pending: Option<PressPending>,
     clipboard: Option<arboard::Clipboard>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -114,13 +135,15 @@ impl App {
             config,
             state,
             pty_manager: PtyManager::new(sink),
-            ui: UiLayer::new(),
+            ui: None,
             actions: Vec::with_capacity(16),
             render_scratch: Vec::new(),
             dirty_tiles: HashSet::new(),
             last_rendered_focus: None,
             modifiers: ModifiersState::empty(),
             cursor_pos: PhysicalPosition::new(0.0, 0.0),
+            dragging_tile: None,
+            press_pending: None,
             // `arboard::Clipboard::new()` can fail in headless environments
             // (e.g. CI without a display). Degrade to "no paste support"
             // rather than panicking the app.
@@ -144,17 +167,24 @@ impl App {
     }
 
     /// Compute the layout of tile rects inside the current window, using
-    /// the active workspace's layout.
+    /// the active workspace's layout. Reserves the top `STRIP_HEIGHT`
+    /// pixels (in logical coords) for the egui strip.
     fn tile_rects(&self, layout: Layout) -> Vec<Rect> {
         let Some(renderer) = self.renderer.as_ref() else {
             return Vec::new();
         };
         let (win_w, win_h) = renderer.size();
+        let scale = self
+            .window
+            .as_ref()
+            .map(|w| w.scale_factor() as f32)
+            .unwrap_or(1.0);
+        let strip_px = STRIP_HEIGHT * scale;
         let area = Rect {
             x: WINDOW_INSET_PX,
-            y: WINDOW_INSET_PX,
+            y: strip_px + WINDOW_INSET_PX,
             width: (win_w as f32 - 2.0 * WINDOW_INSET_PX).max(1.0),
-            height: (win_h as f32 - 2.0 * WINDOW_INSET_PX).max(1.0),
+            height: (win_h as f32 - strip_px - 2.0 * WINDOW_INSET_PX).max(1.0),
         };
         let mut rects = compute_tile_rects(layout, area);
         // Shrink each rect by the gap so neighboring tiles are visibly
@@ -234,6 +264,7 @@ impl App {
             PtyEvent::OutputReceived { tile_id } => {
                 if let Some(tile) = self.state.tile_mut(tile_id) {
                     tile.has_new_output = true;
+                    tile.last_output_at = Some(Instant::now());
                 }
                 self.dirty_tiles.insert(tile_id);
                 self.state.request_redraw();
@@ -328,16 +359,22 @@ impl App {
         }
     }
 
-    fn render_if_needed(&mut self) {
+    fn render_if_needed(&mut self, ui_frame: Option<PreparedFrame>) {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
         let (win_w, win_h) = renderer.size();
+        let scale = self
+            .window
+            .as_ref()
+            .map(|w| w.scale_factor() as f32)
+            .unwrap_or(1.0);
+        let strip_px = STRIP_HEIGHT * scale;
         let area = Rect {
             x: WINDOW_INSET_PX,
-            y: WINDOW_INSET_PX,
+            y: strip_px + WINDOW_INSET_PX,
             width: (win_w as f32 - 2.0 * WINDOW_INSET_PX).max(1.0),
-            height: (win_h as f32 - 2.0 * WINDOW_INSET_PX).max(1.0),
+            height: (win_h as f32 - strip_px - 2.0 * WINDOW_INSET_PX).max(1.0),
         };
         self.render_scratch.clear();
         let theme = self.config.theme.clone();
@@ -415,7 +452,12 @@ impl App {
             }
         }
 
-        renderer.render_frame(&self.render_scratch);
+        let ui_frame = ui_frame.map(|p| UiFrame {
+            primitives: p.primitives,
+            textures_delta: p.textures_delta,
+            pixels_per_point: p.pixels_per_point,
+        });
+        renderer.render_frame(&self.render_scratch, ui_frame.as_ref());
         self.last_frame = Instant::now();
         self.last_rendered_focus = focused;
         self.dirty_tiles.clear();
@@ -468,9 +510,51 @@ impl App {
         }
     }
 
-    fn handle_mouse_click(&mut self, phys_x: f64, phys_y: f64) {
+    /// Begin a Cmd+drag from a tile. Records the tile under the pointer;
+    /// `end_tile_drag` checks the drop target on release.
+    fn begin_tile_drag(&mut self, phys_x: f64, phys_y: f64) {
         if let Some(tile_id) = self.tile_at(phys_x as f32, phys_y as f32) {
-            self.actions.push(Action::FocusTile(tile_id));
+            self.dragging_tile = Some(tile_id);
+        }
+    }
+
+    /// Finish a tile drag. If the pointer landed on a workspace card,
+    /// emit `Action::MoveTile` — the spec's "signature" drag-tile-to-card
+    /// interaction. A drop onto empty strip (strip area, no card hit)
+    /// spins the tile out into its own new workspace. Otherwise no-op.
+    fn end_tile_drag(&mut self) {
+        let Some(tile_id) = self.dragging_tile.take() else {
+            return;
+        };
+        let Some(ui) = self.ui.as_ref() else {
+            return;
+        };
+        let scale = self
+            .window
+            .as_ref()
+            .map(|w| w.scale_factor() as f32)
+            .unwrap_or(1.0);
+        // `card_at` expects egui logical pixels; winit gives us physical.
+        let logical_x = self.cursor_pos.x as f32 / scale;
+        let logical_y = self.cursor_pos.y as f32 / scale;
+        if let Some(target_workspace) = ui.card_at(logical_x, logical_y) {
+            // Don't bother if the drop target already owns this tile.
+            let same_workspace =
+                self.state.workspaces.iter().any(|ws| {
+                    ws.id == target_workspace && ws.tiles.iter().any(|t| t.id == tile_id)
+                });
+            if !same_workspace {
+                self.actions.push(Action::MoveTile {
+                    tile_id,
+                    target_workspace,
+                });
+            }
+            return;
+        }
+        // Dropped inside the strip but not on a card → spin out.
+        if (0.0..=STRIP_HEIGHT).contains(&logical_y) {
+            self.actions
+                .push(Action::MoveTileToNewWorkspace { tile_id });
         }
     }
 
@@ -560,6 +644,16 @@ impl App {
                 self.actions.push(Action::CreateWorkspace);
                 true
             }
+            'l' => {
+                // Open inline rename for the active workspace's card.
+                let ws_id = self.state.active_workspace;
+                let label = self.state.active_workspace().label.clone();
+                if let Some(ui) = self.ui.as_mut() {
+                    ui.start_rename(ws_id, label);
+                }
+                self.state.request_redraw();
+                true
+            }
             'g' => {
                 // Cycle presets: 1x1 → 2x1 → 2x2 → 3x2 → 1x1.
                 let ws_id = self.state.active_workspace;
@@ -577,6 +671,64 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// Build one egui frame (strip widgets + tessellated geometry). Emits
+    /// any user interactions (card clicks, `+` presses) into
+    /// `self.actions` so the next `about_to_wait` tick applies them.
+    fn build_ui_frame(&mut self) -> Option<PreparedFrame> {
+        let window = self.window.as_ref()?.clone();
+        // Compute the drag-ghost payload before mutably borrowing `ui` —
+        // resolving the tile title needs a shared borrow of `self.state`.
+        let ghost = self.dragging_tile.and_then(|tid| {
+            self.state.tile(tid).map(|t| {
+                let label = if t.title.is_empty() {
+                    format!("Tile {}", tid)
+                } else {
+                    t.title.clone()
+                };
+                TileDragGhost { label }
+            })
+        });
+        let ui = self.ui.as_mut()?;
+        ui.set_tile_drag_ghost(ghost);
+        Some(ui.run_frame(&window, &self.state, &mut self.actions))
+    }
+
+    /// Drain `self.actions` through `apply_action`. Marks every
+    /// currently-visible tile dirty afterwards — most actions reshuffle
+    /// rects (SetLayout, CreateTile, CloseTile, SwitchWorkspace), and
+    /// recomputing per-tile dirtiness is cheaper than tracking which
+    /// action affects which tile.
+    fn apply_pending_actions(&mut self) {
+        if self.actions.is_empty() {
+            return;
+        }
+        let pending: Vec<Action> = self.actions.drain(..).collect();
+        let layout = self.state.active_workspace().layout;
+        let rects = self.tile_rects(layout);
+        let default_size = rects
+            .first()
+            .copied()
+            .map(|r| self.pty_size_for_rect(r))
+            .unwrap_or(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        let mut adapter = PtyAdapter {
+            manager: &mut self.pty_manager,
+            default_size,
+        };
+        for action in pending {
+            apply_action(&mut self.state, &mut adapter, action);
+        }
+        self.resize_all_ptys();
+        for tile in &self.state.active_workspace().tiles {
+            self.dirty_tiles.insert(tile.id);
+        }
+        self.state.request_redraw();
     }
 
     /// Resize every live PTY so its rows/cols match the per-tile rect the
@@ -626,7 +778,9 @@ impl ApplicationHandler<PtyEvent> for App {
             self.config.theme.clone(),
             self.config.font.size_px,
         );
+        let ui = UiLayer::new(&window);
         self.renderer = Some(renderer);
+        self.ui = Some(ui);
         self.window = Some(window);
         self.ensure_starter_tiles();
     }
@@ -637,6 +791,22 @@ impl ApplicationHandler<PtyEvent> for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Give egui first crack at every event — it needs hover and
+        // pointer state even for events it doesn't ultimately "consume".
+        // Application-level shortcuts (Cmd+*) and app lifecycle events
+        // still run regardless; terminal pointer/text input is gated
+        // below.
+        let ui_response = match (self.ui.as_mut(), self.window.as_ref()) {
+            (Some(ui), Some(window)) => ui.on_window_event(window, &event),
+            _ => EventResponse {
+                consumed: false,
+                repaint: false,
+            },
+        };
+        if ui_response.repaint {
+            self.state.request_redraw();
+        }
+        let ui_consumed = ui_response.consumed;
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -663,23 +833,83 @@ impl ApplicationHandler<PtyEvent> for App {
                 if self.handle_app_shortcut(&key) {
                     return;
                 }
-                self.handle_key(&key);
+                // A focused egui text widget consumes keystrokes; don't
+                // double-dispatch to the terminal.
+                let ui_wants_kb = self.ui.as_ref().is_some_and(|u| u.wants_keyboard());
+                if !ui_wants_kb {
+                    self.handle_key(&key);
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = position;
+                // Press-pending: if the pointer crossed the drag threshold
+                // while held, upgrade to a tile drag so plain left-drag
+                // moves a tile to a card.
+                if let Some(p) = self.press_pending.as_ref() {
+                    let dx = position.x - p.phys_pos.x;
+                    let dy = position.y - p.phys_pos.y;
+                    if (dx * dx + dy * dy).sqrt() > DRAG_THRESHOLD_PX {
+                        self.dragging_tile = Some(p.tile_id);
+                        self.press_pending = None;
+                        self.state.request_redraw();
+                    }
+                }
+                // While a tile drag is active the ghost pill needs to
+                // follow the cursor; force a redraw each move so it
+                // tracks smoothly.
+                if self.dragging_tile.is_some() {
+                    self.state.request_redraw();
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
             }
+            // Left press over a tile:
+            //   - Cmd held → start tile drag immediately (legacy path, also
+            //     useful when the tile is already focused and the user
+            //     wants to drag without a focus flicker).
+            //   - Plain → enter "press pending" and defer the focus-vs-drag
+            //     decision to the next CursorMoved / Released event. This
+            //     lets plain drag-to-card work without a modifier while
+            //     still preserving single-click-to-focus.
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } => {
-                self.handle_mouse_click(self.cursor_pos.x, self.cursor_pos.y);
+            } if !ui_consumed => {
+                if self.modifiers.super_key() {
+                    self.begin_tile_drag(self.cursor_pos.x, self.cursor_pos.y);
+                } else if let Some(tile_id) =
+                    self.tile_at(self.cursor_pos.x as f32, self.cursor_pos.y as f32)
+                {
+                    self.press_pending = Some(PressPending {
+                        tile_id,
+                        phys_pos: self.cursor_pos,
+                    });
+                }
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            // Release: if we were in press-pending and never crossed the
+            // drag threshold, this was a plain click → focus the tile.
+            // Otherwise the user was dragging — finish the drop.
+            // `ui_consumed` is intentionally ignored here: a drop onto a
+            // card is precisely when ui_consumed is true.
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if let Some(p) = self.press_pending.take() {
+                    self.actions.push(Action::FocusTile(p.tile_id));
+                } else {
+                    self.end_tile_drag();
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } if !ui_consumed => {
                 self.handle_mouse_wheel(delta);
             }
             WindowEvent::RedrawRequested => {
-                self.render_if_needed();
+                let ui_frame = self.build_ui_frame();
+                self.render_if_needed(ui_frame);
             }
             _ => {}
         }
@@ -690,49 +920,23 @@ impl ApplicationHandler<PtyEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.ui.draw_strip(&self.state, &mut self.actions);
+        // Drain any accumulated actions from earlier events (keyboard
+        // shortcuts, click-to-focus) BEFORE building the UI frame so the
+        // strip reflects the latest workspace state.
         if !self.actions.is_empty() {
-            let pending: Vec<Action> = self.actions.drain(..).collect();
-            let default_size = self
-                .window
-                .as_ref()
-                .map(|_| {
-                    let layout = self.state.active_workspace().layout;
-                    let rects = self.tile_rects(layout);
-                    rects
-                        .first()
-                        .copied()
-                        .map(|r| self.pty_size_for_rect(r))
-                        .unwrap_or(PtySize {
-                            rows: 24,
-                            cols: 80,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        })
-                })
-                .unwrap_or(PtySize {
-                    rows: 24,
-                    cols: 80,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                });
-            let mut adapter = PtyAdapter {
-                manager: &mut self.pty_manager,
-                default_size,
-            };
-            for action in pending {
-                apply_action(&mut self.state, &mut adapter, action);
-            }
-            // Layout / zen / new-tile may have changed per-tile rects.
-            self.resize_all_ptys();
-            // After any action we don't know precisely which tiles are
-            // stale — SetLayout/CreateTile/CloseTile all reshuffle things.
-            // Mark everything currently visible dirty; reshapes are cheap
-            // now that they're content-hash guarded in the renderer.
-            for tile in &self.state.active_workspace().tiles {
-                self.dirty_tiles.insert(tile.id);
-            }
+            self.apply_pending_actions();
         }
+
+        // Build the egui frame. This also emits any strip interactions
+        // (card clicks, `+` presses) into `self.actions`.
+        let ui_frame = self.build_ui_frame();
+
+        // Fold those newly-emitted actions in too, so the next render
+        // reflects the workspace switch / creation immediately.
+        if !self.actions.is_empty() {
+            self.apply_pending_actions();
+        }
+
         // Render INLINE here rather than calling `request_redraw()` and
         // waiting for winit to deliver `RedrawRequested` on the next loop
         // turn. That round-trip was adding a full event-loop wakeup of
@@ -741,7 +945,7 @@ impl ApplicationHandler<PtyEvent> for App {
         // second time to deliver RedrawRequested, and only then did we
         // render. Rendering here collapses the round-trip.
         if self.state.needs_redraw && self.renderer.is_some() {
-            self.render_if_needed();
+            self.render_if_needed(ui_frame);
         }
         event_loop.set_control_flow(ControlFlow::Wait);
     }
