@@ -56,11 +56,11 @@ Checklist mirrors §8 of the spec. Tick items as they land. Sub-items that aren'
 - [x] Crate skeletons: `kookaburra-{core,pty,render,ui,app}` compile empty
 - [x] `kookaburra-core::ids` — `WorkspaceId`, `TileId`, `PtyId` newtypes + generators
 - [ ] `kookaburra-core::state` — `AppState`, `Workspace`, `Tile` structs
-- [ ] `kookaburra-core::layout` — `Layout` enum + rect computation
+- [x] `kookaburra-core::layout` — `Layout` enum + rect computation
 - [ ] `kookaburra-core::action` — `Action` enum
 - [ ] `kookaburra-core::config` — `Config` stub
 - [ ] `kookaburra-core::worktree` — `Worktree` types (no impl yet)
-- [ ] Unit tests: layout rect math for 1×1, 2×1, 1×2, 2×2, 3×2, 2×3
+- [x] Unit tests: layout rect math for 1×1, 2×1, 1×2, 2×2, 3×2, 2×3
 - [x] Unit tests: ID uniqueness
 - [ ] Unit tests: basic `AppState` construction + tile insert/remove
 - [ ] `kookaburra-pty`: spawn a PTY via `portable-pty`, read bytes, verify with stdout dump
