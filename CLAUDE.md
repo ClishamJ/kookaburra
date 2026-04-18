@@ -54,14 +54,14 @@ Checklist mirrors §8 of the spec. Tick items as they land. Sub-items that aren'
 ### Phase 1 — Single tile end-to-end
 
 - [x] Crate skeletons: `kookaburra-{core,pty,render,ui,app}` compile empty
-- [ ] `kookaburra-core::ids` — `WorkspaceId`, `TileId`, `PtyId` newtypes + generators
+- [x] `kookaburra-core::ids` — `WorkspaceId`, `TileId`, `PtyId` newtypes + generators
 - [ ] `kookaburra-core::state` — `AppState`, `Workspace`, `Tile` structs
 - [ ] `kookaburra-core::layout` — `Layout` enum + rect computation
 - [ ] `kookaburra-core::action` — `Action` enum
 - [ ] `kookaburra-core::config` — `Config` stub
 - [ ] `kookaburra-core::worktree` — `Worktree` types (no impl yet)
 - [ ] Unit tests: layout rect math for 1×1, 2×1, 1×2, 2×2, 3×2, 2×3
-- [ ] Unit tests: ID uniqueness
+- [x] Unit tests: ID uniqueness
 - [ ] Unit tests: basic `AppState` construction + tile insert/remove
 - [ ] `kookaburra-pty`: spawn a PTY via `portable-pty`, read bytes, verify with stdout dump
 - [ ] Wire `alacritty_terminal::Term` + parser; log grid on change
