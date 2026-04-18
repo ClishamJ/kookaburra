@@ -1,0 +1,1205 @@
+
+Okay, I have a small side project idea. I want a very simple but EXTREMELY ABSOLUTELY MAX MacOS optimization and speed. That's what this is about, from the very top. From there, it should be able to open (or simulate) several (up to ~6) Terminal windows and be a very fancy window manager (defaulting to 3 columns of two).
+
+What's the best way to do this, for maximum speed? COnsider both what would be best for this for MacOS, and best for general usability. I want max speed above all, but I'm also curious if it's viable to go cross-platform and keep performance.
+
+11:36 PM
+This is a fun question. Let me think through it properly before giving you a recommendation, because "maximum speed on macOS" points in a very different direction than "cross-platform."
+
+The honest framing
+What you're describing is essentially a lightweight tiling window manager that spawns/hosts terminal emulators. There are two fundamentally different architectures, and picking the wrong one will cost you an order of magnitude in performance.
+
+Option A: Native macOS (the speed answer)
+Swift + AppKit, spawning PTYs directly. No Electron, no web layer, no cross-platform abstraction.
+
+Window management: Use NSWindow for real windows, or a single NSWindow with custom NSView tiles if you want it to feel like one app. For actual tiling of other windows, you'd use the Accessibility API (this is how yabai, Rectangle, and Amethyst work).
+Terminal rendering: Use SwiftTerm (the well-maintained Swift port of xterm.js) or write directly against a PTY using forkpty() and render with Metal/CoreText. SwiftTerm gets you 90% there with near-native speed.
+Why it's fast: Direct GPU compositing via Metal, zero IPC overhead for rendering, AppKit windows are already the fastest thing the OS can draw, and PTY handling is a syscall away.
+Realistic performance: sub-16ms frame times trivially, cold start under 200ms, memory footprint ~30-60MB for six terminals.
+
+Option B: Cross-platform (the pragmatic answer)
+You have a spectrum here, ordered by performance:
+
+Rust + wgpu + a Rust terminal crate (like alacritty_terminal as a library). This is what Zellij and Wezterm do. Performance is genuinely excellent — Alacritty is GPU-accelerated and arguably faster than Terminal.app. Cross-platform cost is near zero at runtime.
+Tauri (Rust backend + webview frontend). Uses the system webview (WKWebView on macOS), so much lighter than Electron. Good for the UI chrome, but you'd still want native PTY handling in the Rust side and a WebGL terminal renderer like xterm.js. Noticeably slower than option 1.
+Electron. Don't. You said max speed.
+My recommendation
+If "max speed above all" is real: Swift + AppKit + SwiftTerm, single window with a custom tiling view. For your scope (up to 6 terminals, 3×2 default grid), this is maybe a weekend of work and will feel instant in a way nothing else will.
+
+If you want cross-platform without giving up much: Rust + wgpu + alacritty_terminal. You'd be building something in the Wezterm family. More work, but the performance ceiling is nearly identical to native — Alacritty outperforms Terminal.app on macOS despite being cross-platform, because GPU rendering beats AppKit's text rendering for terminal workloads specifically.
+
+The surprising thing: for terminal rendering specifically, a well-built Rust+GPU app can match or beat native AppKit, because terminals are a workload where GPU text rendering genuinely wins. For window chrome and OS integration, native Swift wins easily.
+
+One clarifying question before I go deeper
+Are you tiling terminals inside one window of your app (like tmux or Zellij), or do you want your app to manage actual separate OS windows in a grid (like yabai or Rectangle do)? These are very different projects — the first is a terminal multiplexer with a pretty UI, the second is a window manager that happens to launch terminals. Which one matches your mental model?
+
+Let's go with this approach: Rust + wgpu + a Rust terminal crate (like alacritty_terminal as a library). This is what Zellij and Wezterm do. Performance is genuinely excellent — Alacritty is GPU-accelerated and arguably faster than Terminal.app. Cross-platform cost is near zero at runtime.
+
+11:37 PM
+Good pick. This is the path with the best performance-to-portability ratio, and you'll end up with something in genuinely respectable company (Wezterm, Zellij, Alacritty itself). Let me lay out a concrete architecture and the specific crates, then flag the real gotchas.
+
+Stack
+Core crates:
+
+alacritty_terminal — the terminal state machine, PTY I/O, parser, grid model. You get all the hard stuff (VT100/xterm emulation, escape sequence handling, scrollback) for free.
+wgpu — GPU abstraction. Uses Metal on macOS, Vulkan on Linux, DX12 on Windows. Zero-cost for your use case.
+winit — windowing and input. The standard pairing with wgpu.
+glyphon — text rendering on top of wgpu, built on cosmic-text. This is the current best-in-class for GPU text in Rust. Handles font shaping, fallback, subpixel positioning.
+portable-pty — if you want cleaner cross-platform PTY handling than rolling your own. Alacritty's internal PTY code works too but is less ergonomic to use externally.
+Supporting:
+
+tokio or smol for async PTY reads. tokio is the safer default.
+serde + toml for config.
+log + env_logger for debugging.
+Architecture
+Think of it as three layers:
+
+1. The session layer. Each "terminal" is a (PTY, alacritty_terminal::Term) pair running on its own task. The PTY reader pumps bytes into the Term's parser; the Term mutates its grid; you signal the renderer that a tile is dirty.
+
+2. The layout layer. A simple tree or flat array of tiles with rectangles. For your 3×2 default, this is trivial — just divide the window rect into a grid. Keep it abstract enough that you can add splits/resizing later without rewriting. A Layout enum with Grid { cols, rows } and later Split { direction, ratio, children } will scale fine.
+
+3. The render layer. One wgpu surface for the whole window. Each frame, iterate tiles, ask each Term for its visible cells, feed them to glyphon, draw borders/chrome with a simple quad pipeline. Only redraw tiles that are dirty, but since you're GPU-bound and terminals are small, redrawing everything at 60fps is also fine and simpler.
+
+The critical decision: one window, many tiles (not many OS windows). This is what gives you the speed and the "fancy window manager" feel without fighting the OS.
+
+The gotchas
+Font rendering is where cross-platform terminals die. macOS users expect SF Mono / Menlo with proper ligatures and emoji fallback. glyphon/cosmic-text handles this reasonably but test early with emoji, CJK, and powerline glyphs. Budget real time for this — it's the #1 place "fast Rust terminal" projects feel janky.
+
+PTY resize signaling. When you resize a tile, you must send TIOCSWINSZ to the PTY and update the Term's grid size. Miss either and you get visual corruption or programs that don't know their new size. alacritty_terminal handles the grid side; portable-pty handles the ioctl.
+
+Input routing. Only the focused tile gets keystrokes. Sounds obvious, but you'll want a clear focus model from day one — click-to-focus plus a keybinding like Cmd+1..6 to jump between tiles. Decide early whether Cmd+W closes a tile or the window.
+
+Scrollback and selection. alacritty_terminal gives you the data structures but not the UX. Mouse selection, copy-on-select, scroll-to-bottom-on-input — these are all code you write. Plan for it.
+
+The macOS-specific polish. Even though you're cross-platform, on macOS you'll want: proper titlebar integration (winit supports this), native Cmd key handling, clipboard via arboard, and ideally code-signing + notarization for distribution. Budget a day for this at the end.
+
+Build order I'd suggest
+Window with wgpu clearing to a color. (1 hour)
+One tile rendering static text with glyphon. (half day)
+One tile backed by a real PTY running your shell, read-only display. (half day)
+Input routing — you can now actually use it as a terminal. (few hours)
+Grid layout with N tiles, focus switching. (half day)
+Resize handling, both window and tile. (few hours)
+Polish: config file, keybindings, colors, fonts. (open-ended)
+You'll have something genuinely usable by end of step 4, which is motivating. Steps 1-4 is maybe a weekend if you're comfortable in Rust.
+
+One thing I'd push back on
+You said "simulate" terminal windows as a fallback. Don't — real PTYs via alacritty_terminal + portable-pty are not meaningfully harder than faking it, and faking it means you can't actually run vim or htop, which kills the project's usefulness. Go real from step 3.
+
+Want me to sketch out the actual module structure and a minimal main.rs that gets you to step 2 or 3?
+
+This all sounds amazing, I'm 100% down for all of this.
+
+Let's design first more.
+
+Starting with usability design. This is an app as a "focused mode" claude code session app. We need the ability to have several console windows open at a time in a clean structure.
+
+Next, we want a way to be able to have multiple "screens". But I think we want to go further. I think we want a narrow UI strip at the top with cards; each card represents a different screen. You can click on the card to switch to that "screen". But also it represents each active console on that screen; if you [mouse down]+drag, you can drag those console windows to different screens. You can name the screens with a nicely formatted label, etc.
+
+What do you think of this? What other features go along with this and would be helpful for this use case?
+
+Show more
+11:40 PM
+This is a really strong direction. The "focused mode for Claude Code sessions" framing sharpens everything — it tells us what to optimize for and what to cut. Let me react to your design, then build on it.
+
+What's good about your design
+The top strip with cards is the right instinct. It solves the problem that tabs and traditional window managers both fail at: giving you a spatial overview of parallel work. When you're running multiple Claude Code sessions — say, one on a frontend refactor, one on a backend migration, one exploring a library — each session is a context, not just a window. Your "screen" concept maps to that naturally.
+
+The drag-to-move interaction is also right. It makes the spatial model tangible. You see your work, you grab it, you move it. No command palette, no keybinding to memorize for something that's fundamentally a spatial operation.
+
+One thing I'd gently refine: I'd call them workspaces rather than screens. "Screen" overloads with physical monitors and will confuse you in docs and in your own head six months from now. Workspaces is the established term (i3, GNOME, macOS Spaces) and it's what users will expect.
+
+How I'd flesh out the strip
+The strip is doing two jobs at once — workspace switcher and live preview of what's in each workspace. That's ambitious but achievable. Some specifics:
+
+Card contents. Each card shows the workspace label, a count or mini-representation of its terminals, and ideally a subtle activity indicator (is something running? did output just arrive?). For Claude Code specifically, "is Claude currently generating?" is the single most valuable signal you could surface — it lets you tab away from a long generation and glance up to see when it's done.
+
+Card size. Keep them small. 120-160px wide, maybe 50-60px tall. The strip should feel like a status bar, not a second UI. If cards get bigger you'll be tempted to put more in them and the whole thing bloats.
+
+The drag interaction. Two modes worth distinguishing: dragging a card reorders workspaces; dragging a terminal out of the current view up onto a card moves that terminal to that workspace. The second one is the magic interaction. Make sure the target card highlights clearly during hover, and consider a "drop on empty space in strip" gesture that creates a new workspace with that terminal.
+
+Labels. Let users rename by double-clicking the label. Auto-generate smart defaults — if a terminal's CWD is ~/projects/foo and no label is set, show "foo". This is small but makes the app feel alive from first launch.
+
+Features that pull their weight for this use case
+Thinking specifically about "focused mode for Claude Code sessions," here's what I'd prioritize:
+
+A "primary" tile per workspace. In a 3×2 grid, one tile is usually the main Claude Code session and the others are supporting (a shell for running tests, a log tailer, a scratch REPL). Let users mark one tile as primary — it gets a subtle accent border and becomes the default focus when switching to that workspace. Small feature, large quality-of-life win.
+
+Output-aware dimming. Inactive tiles dim slightly. Tiles with new output since you last looked get a subtle pulse or edge highlight. This is the terminal equivalent of an unread indicator and it's perfect for Claude Code where you often have generations finishing in the background.
+
+"Follow" mode for a tile. Sometimes you want a tile to always scroll to the latest output (tailing logs, watching a build). Sometimes you want it pinned where you left it. A per-tile toggle handles both cleanly.
+
+Bookmarkable tile configurations. Save the current workspace layout (tile count, sizes, working directories, maybe even startup commands) as a template. "New workspace from template: Rust project" spawns three tiles with cargo watch, a shell in the repo, and a Claude Code session pre-prompted. This is the feature that turns it from a pretty terminal into a genuine productivity tool.
+
+A zen/solo mode. Keybinding to temporarily maximize the focused tile to fill the whole window, hiding the strip and other tiles. Press again to restore. For when you're deep in something and want the chrome gone. Cmd+Enter is the canonical binding.
+
+Search across all tiles in a workspace. Cmd+F searches scrollback in the focused tile; Cmd+Shift+F searches across every tile in the workspace. Invaluable when you remember Claude said something useful in one of those sessions but don't remember which.
+
+Things I'd cut or defer
+Splits and arbitrary layouts. Your 3×2 default is great. Resist the urge to add i3-style arbitrary splits in v1. Offer 1×1, 2×1, 2×2, 3×2, and 2×3 presets and you'll cover 95% of real use. Tiling window managers get complicated fast and the complexity doesn't serve the "focused mode" goal.
+
+Per-tile themes. Tempting, actively bad. Uniform visual treatment is what makes a grid of terminals readable at a glance.
+
+Tabs within tiles. You have workspaces and tiles. Adding tabs is a third level of hierarchy that users will not hold in their head. Don't do it.
+
+Session persistence across restarts. Nice to have, but it's a rabbit hole (reattaching to running processes is genuinely hard). Defer until v2. v1 should restore layout (tile counts, labels, CWDs) but not running processes.
+
+The one design question worth resolving now
+How does the strip behave when you have many workspaces? Three reasonable answers:
+
+Scroll horizontally. Cards stay the same size; strip becomes scrollable. Simple, but hides workspaces off-screen.
+Shrink cards. Cards compress as you add more. Good up to maybe 10 workspaces, then unreadable.
+Cap + overflow menu. Hard cap at ~8 visible, rest in a dropdown. Pragmatic but less spatial.
+I'd go with option 1 plus a keybinding (Cmd+1..9) for direct access to the first nine. The strip stays spatial, and power users get keyboard speed.
+
+Suggested v1 scope
+If I were drawing a line: strip with cards, drag to reorder workspaces, drag terminals between workspaces, rename workspaces, 5 preset layouts, focus indicators, output-aware dimming, zen mode, and workspace templates. That's a genuinely differentiated product and it's achievable. Everything else is v2.
+
+Want me to sketch what the strip looks like visually, or move on to how this maps to the Rust architecture (which parts of the UI live where, how state flows)?
+
+Yes please map out the rust architecture.
+
+11:41 PM
+Good. Let me map this out at the level where you could start building, but keep it honest about the tradeoffs at each layer.
+
+The mental model first
+The whole app is a loop: PTYs produce bytes → terminal state machines consume them → a renderer draws the current state 60 times a second → input events flow back to the focused PTY. Everything else is organization around that loop.
+
+The architecture I'd recommend has three concurrency domains:
+
+The main thread owns winit's event loop (required on macOS), wgpu, and all rendering. It reads from shared state, never writes application logic.
+A tokio runtime owns all PTY I/O. One task per PTY, reading bytes and pushing into the terminal state machine.
+A message bus connects them. UI events go one way, render-dirty signals go the other.
+This is cleaner than it sounds and it keeps you out of the two traps that kill Rust GUI projects: blocking the render thread on I/O, and lock contention between readers and the renderer.
+
+Crate structure
+I'd split this into a workspace with several crates from day one. Not because it's a big project yet, but because the boundaries force good design and compile times stay sane:
+
+focusterm/
+├── Cargo.toml                  # workspace root
+├── crates/
+│   ├── focusterm-core/         # domain types, no I/O, no rendering
+│   ├── focusterm-pty/          # PTY management, async readers
+│   ├── focusterm-render/       # wgpu + glyphon rendering
+│   ├── focusterm-ui/           # strip, cards, input handling, layout
+│   └── focusterm-app/          # binary: ties everything together
+└── assets/
+    └── fonts/
+Why this split: core has no dependencies on wgpu, winit, or tokio. You can unit-test layout math, workspace logic, and state transitions without spinning up a GPU. pty depends on core and tokio. render depends on core, wgpu, glyphon. ui depends on core, winit, render. app is the only crate that knows about all of them.
+
+The core domain types
+This is where you spend the most design time and the least coding time. Get these right and the rest follows:
+
+rust
+// focusterm-core/src/lib.rs
+
+pub struct AppState {
+    pub workspaces: Vec<Workspace>,
+    pub active_workspace: WorkspaceId,
+    pub focused_tile: Option<TileId>,
+    pub config: Config,
+}
+
+pub struct Workspace {
+    pub id: WorkspaceId,
+    pub label: String,
+    pub layout: Layout,
+    pub tiles: Vec<Tile>,
+    pub primary_tile: Option<TileId>,
+}
+
+pub struct Tile {
+    pub id: TileId,
+    pub pty_id: PtyId,              // handle into PtyManager
+    pub term: Arc<FairMutex<Term<EventProxy>>>,  // alacritty_terminal
+    pub has_new_output: bool,
+    pub follow_mode: bool,
+    pub cwd: Option<PathBuf>,       // for smart labels
+}
+
+pub enum Layout {
+    Grid { cols: u8, rows: u8 },
+    // Later: Split { .. }
+}
+Two things worth noting. First, Term is wrapped in FairMutex (from parking_lot) because both the PTY reader task and the renderer need access — the reader to push parsed bytes, the renderer to read the grid. FairMutex prevents the reader from starving the renderer under heavy output (think yes or a noisy compile). Second, IDs are newtypes around u64 or Uuid, never raw integers — this catches "used a tile ID where a workspace ID was expected" at compile time.
+
+The PTY layer
+This is where alacritty_terminal and portable-pty meet tokio:
+
+rust
+// focusterm-pty/src/lib.rs
+
+pub struct PtyManager {
+    ptys: HashMap<PtyId, PtyHandle>,
+    event_tx: mpsc::Sender<PtyEvent>,
+}
+
+pub struct PtyHandle {
+    writer: Box<dyn Write + Send>,   // for input
+    resize: Box<dyn Fn(PtySize) + Send>,
+    _reader_task: JoinHandle<()>,
+}
+
+pub enum PtyEvent {
+    OutputReceived { tile_id: TileId },  // just a dirty signal
+    ProcessExited { tile_id: TileId, status: ExitStatus },
+    TitleChanged { tile_id: TileId, title: String },
+}
+The reader task does this in a loop: read up to 4KB from the PTY, feed it to the alacritty_terminal::Term's parser (which mutates the grid), send a lightweight OutputReceived event. It does not send the output itself — the renderer reads directly from the Term. This is important: you're not copying terminal output through a channel, you're just signaling "this tile changed, redraw it."
+
+Two subtleties here. First, alacritty_terminal uses a trait-based event system (EventListener) to report things like bell, title changes, clipboard requests. You implement a thin EventProxy that forwards to your mpsc channel. Second, coalesce dirty signals in the renderer — if a tile fires OutputReceived 500 times between frames, you redraw it once. Otherwise you're wasting CPU on useless signaling.
+
+The render layer
+This is the most performance-critical code and also the most self-contained:
+
+rust
+// focusterm-render/src/lib.rs
+
+pub struct Renderer {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    surface: wgpu::Surface,
+    text_renderer: glyphon::TextRenderer,
+    atlas: glyphon::TextAtlas,
+    font_system: glyphon::FontSystem,
+    swash_cache: glyphon::SwashCache,
+    // Pipelines for background quads, borders, cursor
+    quad_pipeline: QuadPipeline,
+}
+
+impl Renderer {
+    pub fn render_frame(&mut self, state: &AppState) -> Result<()> {
+        // 1. Compute tile rectangles from layout
+        // 2. For each tile: lock its Term briefly, extract visible cells, release lock
+        // 3. Build glyph buffers for all text
+        // 4. Build quad buffers for backgrounds, borders, cursor
+        // 5. Single render pass, draw everything
+        // 6. Present
+    }
+}
+The pattern you want: lock each Term for microseconds, not milliseconds. Extract the visible rows into a Vec<Cell> (or similar), release the lock, then do all rendering work against that snapshot. This is what keeps the PTY reader unblocked even during heavy redraws.
+
+For the strip and cards, you have two choices. You could render them with the same glyphon-based pipeline as the terminals, treating each card as a mini-surface. Or you could treat the strip as a separate UI layer — which leads us to the next question.
+
+The UI layer decision
+You're going to hit a fork here and it's worth naming it: how do you draw non-terminal UI? The strip, cards, labels, dialogs, settings. There are three options:
+
+Roll your own with wgpu + glyphon directly. Maximum performance, maximum control, maximum code. Every button, every hover state, every animation is yours. Reasonable for a minimal app; tedious by month three.
+Use egui with its wgpu backend. Immediate-mode GUI, integrates cleanly with wgpu, handles input, gives you buttons/labels/drag-and-drop for free. Not the prettiest out of the box but highly customizable. This is what a lot of Rust game tools use.
+Use iced or similar retained-mode framework. More "app-like," better defaults, more opinionated about architecture.
+For your use case, I'd go with egui. Here's why: the strip is fundamentally immediate-mode (redraw every frame based on current state), you need drag-and-drop which egui handles well, and it composes cleanly with wgpu — your terminal renderer and egui share a surface, you draw terminals first and egui overlays on top. You give up maybe 1-2ms per frame vs. custom wgpu UI, which is irrelevant for 60fps.
+
+The one place I'd still hand-roll: the terminal rendering itself. Don't put terminals inside egui widgets. Terminals are their own wgpu render pass; egui draws the chrome.
+
+How state flows
+The cleanest pattern for an app like this is a single source of truth with message passing:
+
+rust
+// focusterm-app/src/main.rs (sketched)
+
+fn main() {
+    let event_loop = EventLoop::new();
+    let window = WindowBuilder::new().build(&event_loop)?;
+    
+    let (event_tx, event_rx) = mpsc::channel(256);
+    
+    let runtime = tokio::runtime::Runtime::new()?;
+    let pty_manager = PtyManager::new(event_tx.clone(), runtime.handle().clone());
+    
+    let mut app_state = AppState::new(config);
+    let mut renderer = Renderer::new(&window)?;
+    let mut ui = UiLayer::new();  // egui context
+    
+    event_loop.run(move |event, _, control_flow| {
+        // Drain PTY events (non-blocking)
+        while let Ok(pty_event) = event_rx.try_recv() {
+            handle_pty_event(&mut app_state, pty_event);
+        }
+        
+        match event {
+            Event::WindowEvent { event, .. } => {
+                // Route to ui layer first (it handles strip interactions)
+                // If not consumed, route to focused tile's PTY
+                ui.handle_event(&event, &mut app_state, &pty_manager);
+            }
+            Event::RedrawRequested(_) => {
+                renderer.render_frame(&app_state, &mut ui)?;
+            }
+            _ => {}
+        }
+    });
+}
+The main loop is dumb. It drains events, routes input, draws. All logic lives in pure functions that take &mut AppState and a message. This makes the whole thing testable — you can write tests that say "given this state, when this event happens, the state becomes this" without any GPU or OS involvement.
+
+The gotchas this architecture anticipates
+Font loading on startup. cosmic-text/glyphon enumerates system fonts which takes 100-400ms. Do this on a background thread during window creation so your cold start stays fast. Show a brief loading state if needed.
+
+Surface resize races. When the window resizes, you need to resize the wgpu surface, recompute tile rectangles, and send TIOCSWINSZ to every PTY. Do these in that order and do them synchronously on the main thread — async resize is where subtle rendering bugs live.
+
+The borrow checker will fight you on AppState. You'll have the renderer wanting &AppState while the UI wants &mut AppState while a PTY event wants to mutate a tile. Resist the urge to wrap everything in Arc<Mutex<_>>. Instead: PTY events go through a channel and are applied at the start of each frame, the UI produces a list of Actions that are applied before rendering, and the renderer only ever sees &AppState. One owner, one mutator per phase.
+
+Hot reload of config. Build this in from day one. Watch the config file, reparse on change, swap it into AppState. Saves you a thousand restarts during development.
+
+What I'd build first
+If I were starting Monday morning:
+
+Set up the workspace, get focusterm-app rendering an empty wgpu window with egui overlay saying "hello." (2 hours)
+Implement focusterm-core types with no behavior, just data. Write a few unit tests against layout rectangle computation. (2 hours)
+Implement focusterm-pty with one hardcoded PTY spawning your shell, dump raw bytes to stdout to verify it works. (3 hours)
+Wire alacritty_terminal in — now you have a state machine, not raw bytes. Log the grid contents each time it changes. (3 hours)
+Implement focusterm-render just enough to draw that one terminal's grid with glyphon. (1 day)
+Input routing: keystrokes go to the PTY. You can now actually use it. (half day)
+Add layout: 2 tiles side by side, each with its own PTY. (half day)
+The strip with egui. Static first (just shows one workspace), then interactive. (1 day)
+Multiple workspaces, switching, drag-to-move. (1-2 days)
+End of that: a working prototype of your vision. Maybe 5-6 days of focused work. Everything after is polish, features, and the long tail of terminal compatibility edge cases.
+
+Want me to go deeper on any specific layer? The render pipeline and the egui integration are the two places where the interesting implementation decisions live, and either could use its own dedicated pass.
+
+Great let's do a pass on these two then: The render pipeline and the egui integration are the two places where the interesting implementation decisions live, and either could use its own dedicated pass.
+
+11:50 PM
+Good. These two are where the project either feels instant and polished or feels like "another Rust terminal that's almost there." Let me go deep on each.
+
+The render pipeline
+The fundamental question: how do you go from a grid of terminal cells to pixels on screen, 60+ times a second, for up to six terminals simultaneously?
+
+The frame, end to end
+A single frame does this:
+
+Acquire the surface texture from wgpu. This blocks briefly if the GPU is behind; usually instant.
+Compute tile rectangles from the current layout and window size. Pure math, microseconds.
+For each visible tile, snapshot its terminal grid. Lock the Term, copy the visible rows into a local Vec<RenderCell>, release. This is the only place the render thread touches shared state.
+Build the frame's draw data. Background quads per cell (for non-default backgrounds), glyph runs for text, cursor quad, tile border quads, selection overlay if any.
+One render pass, multiple pipelines. Draw backgrounds, then text, then overlays (cursor, selection, borders). Then egui on top.
+Submit and present.
+The performance discipline is: steps 3 and 4 run on the main thread with no allocations in the hot path, step 5 is where the GPU does the work.
+
+The cell snapshot
+Here's the shape you want:
+
+rust
+#[derive(Copy, Clone)]
+struct RenderCell {
+    ch: char,
+    fg: [u8; 4],
+    bg: [u8; 4],
+    flags: CellFlags,  // bold, italic, underline, inverse, etc.
+}
+
+struct TileSnapshot {
+    cells: Vec<RenderCell>,  // row-major, cols * rows
+    cols: u16,
+    rows: u16,
+    cursor: Option<(u16, u16)>,
+    cursor_style: CursorStyle,
+}
+Preallocate these. Keep one TileSnapshot per tile, reuse across frames, clear() and refill each frame. Zero allocations during steady-state rendering is the goal and it's achievable.
+
+The snapshot pass looks like:
+
+rust
+fn snapshot_tile(tile: &Tile, snapshot: &mut TileSnapshot) {
+    let term = tile.term.lock();  // parking_lot, fast path ~20ns uncontended
+    let grid = term.grid();
+    let display_offset = grid.display_offset();
+    
+    snapshot.cells.clear();
+    snapshot.cols = grid.columns() as u16;
+    snapshot.rows = grid.screen_lines() as u16;
+    
+    for row_idx in 0..snapshot.rows {
+        let line = &grid[Line(row_idx as i32 - display_offset as i32)];
+        for cell in line.iter() {
+            snapshot.cells.push(RenderCell {
+                ch: cell.c,
+                fg: convert_color(cell.fg),
+                bg: convert_color(cell.bg),
+                flags: convert_flags(cell.flags),
+            });
+        }
+    }
+    
+    snapshot.cursor = if term.mode().contains(TermMode::SHOW_CURSOR) {
+        Some((term.grid().cursor.point.column.0 as u16,
+              term.grid().cursor.point.line.0 as u16))
+    } else {
+        None
+    };
+    // lock released here
+}
+The lock is held for the duration of the copy, which for an 80×24 terminal is ~2000 cells of simple struct copies — nanoseconds. For a giant 300×100 terminal it's ~30k cells, still well under a millisecond. The PTY reader will never notice.
+
+The rendering strategy: quads + glyphs
+Two GPU pipelines, both simple:
+
+Background pipeline. Instanced quads. One instance per cell that has a non-default background. Vertex shader takes instance data (cell x, y, width, height, color), fragment shader outputs the color. This is the fastest possible draw path on any GPU — you'll easily push a million cells per second.
+
+Text pipeline. Glyphon handles this. You build a Buffer of text per tile, set its position, and glyphon rasterizes glyphs into an atlas and issues draw calls. Under the hood it's also instanced quads, just with texture sampling.
+
+The sequence per frame:
+
+rust
+fn render_frame(&mut self, state: &AppState) -> Result<()> {
+    let output = self.surface.get_current_texture()?;
+    let view = output.texture.create_view(&Default::default());
+    
+    // Compute layout
+    let tile_rects = compute_tile_rects(&state.active_workspace().layout, 
+                                         self.window_size);
+    
+    // Snapshot all tiles (holds locks briefly)
+    for (tile, rect) in state.active_workspace().tiles.iter().zip(&tile_rects) {
+        snapshot_tile(tile, &mut self.snapshots[tile.id]);
+    }
+    
+    // Build draw data
+    self.bg_quads.clear();
+    for (snapshot, rect) in self.snapshots.iter().zip(&tile_rects) {
+        build_bg_quads(snapshot, rect, &self.cell_metrics, &mut self.bg_quads);
+    }
+    
+    // Build glyphon buffers  
+    for (snapshot, rect) in self.snapshots.iter().zip(&tile_rects) {
+        update_text_buffer(snapshot, rect, &mut self.text_buffers[tile_idx], 
+                          &mut self.font_system);
+    }
+    
+    // Prepare glyphon for this frame
+    self.text_renderer.prepare(
+        &self.device, &self.queue, &mut self.font_system,
+        &mut self.atlas, /* viewport */, 
+        self.text_buffers.iter().map(|b| TextArea { /* ... */ }),
+        &mut self.swash_cache,
+    )?;
+    
+    let mut encoder = self.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(self.bg_color),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        
+        // 1. Cell backgrounds
+        self.quad_pipeline.draw(&mut pass, &self.bg_quads);
+        
+        // 2. Text
+        self.text_renderer.render(&self.atlas, /* viewport */, &mut pass)?;
+        
+        // 3. Cursor and selection overlays
+        self.quad_pipeline.draw(&mut pass, &self.overlay_quads);
+        
+        // 4. Tile borders
+        self.quad_pipeline.draw(&mut pass, &self.border_quads);
+        
+        // 5. egui on top (covered in next section)
+        self.egui_renderer.render(&mut pass, /* ... */);
+    }
+    
+    self.queue.submit(Some(encoder.finish()));
+    output.present();
+    
+    Ok(())
+}
+Note the single render pass. Starting and ending render passes has nontrivial overhead on some backends (especially Metal), so batching everything into one pass matters.
+
+Font metrics and cell grid
+This is where "fast Rust terminals" diverge from "good Rust terminals." The cell grid is the foundation of everything: every cell is the same width, rows are uniform height, and glyphs must be centered within their cells consistently.
+
+Compute this once at startup and on font change:
+
+rust
+struct CellMetrics {
+    width: f32,       // advance width of 'M' in the monospace font
+    height: f32,      // line height
+    ascent: f32,      // baseline offset from top
+    descent: f32,
+}
+Use the metrics of a reference glyph (typically M or 0) as the cell width. For CJK characters that are double-width, render them spanning two cells and skip the next cell. Alacritty's terminal grid already marks these with a WIDE_CHAR flag — honor it.
+
+A subtlety: ligatures break the cell grid. => in Fira Code becomes a single glyph spanning two cells. You have two choices — disable ligatures (what Alacritty does, controversially) or handle them specially (what Wezterm does, complicated). I'd disable in v1 and make it a config option in v2. Users who care will tell you.
+
+Dirty tracking and the "render only what changed" trap
+Obvious optimization: only redraw tiles that changed. Seductive, and mostly a waste for your use case. Here's why.
+
+A Claude Code session emits output continuously during generation. A shell running cargo watch emits output on every file save. htop refreshes every second. In practice, at any given moment something is dirty, and checking dirtiness per tile adds complexity for minimal gain.
+
+The better strategy: redraw the whole window at up to 60fps, but only when something has changed. Track a single needs_redraw boolean. PTY events set it, input events set it, animations set it. If it's false at the end of an event loop iteration, control_flow = ControlFlow::Wait. You get 0% CPU when idle and 60fps when active. This is what most terminals do and it's the right tradeoff.
+
+The one refinement: when output is arriving at extreme rates (yes piped to itself), cap redraws at 60fps regardless of event rate. Otherwise you'll process 10,000 PTY events per frame and starve the renderer. A simple frame budget check in the event loop handles this.
+
+Color and theming
+alacritty_terminal reports colors as Color::Named(NamedColor), Color::Spec(Rgb), or Color::Indexed(u8). You need a color palette to resolve named and indexed colors:
+
+rust
+struct Theme {
+    foreground: Rgb,
+    background: Rgb,
+    cursor: Rgb,
+    ansi: [Rgb; 16],         // the 16 ANSI colors
+    bright_ansi: [Rgb; 16],  // bright variants
+}
+
+fn resolve(color: alacritty_terminal::vte::ansi::Color, theme: &Theme) -> [u8; 4] {
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
+    match color {
+        Color::Named(NamedColor::Foreground) => theme.foreground.into_rgba(),
+        Color::Named(NamedColor::Background) => theme.background.into_rgba(),
+        Color::Named(NamedColor::Red) => theme.ansi[1].into_rgba(),
+        // ... etc
+        Color::Spec(rgb) => [rgb.r, rgb.g, rgb.b, 255],
+        Color::Indexed(i) if i < 16 => theme.ansi[i as usize].into_rgba(),
+        Color::Indexed(i) => xterm_256_color(i).into_rgba(),  // standard table
+    }
+}
+Ship with good defaults. Tokyo Night, Catppuccin Mocha, and Solarized Dark are the unofficial "you ship a terminal, you ship these" list. Let users supply their own via config.
+
+egui integration
+Now the UI layer. The interesting question: how do egui and your wgpu terminal renderer share the same window without fighting?
+
+The integration pattern
+Use egui-wgpu (the official egui backend for wgpu) and egui-winit (the official event bridge). The pattern is well-established:
+
+rust
+struct UiLayer {
+    egui_ctx: egui::Context,
+    egui_winit: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
+}
+
+impl UiLayer {
+    fn new(window: &Window, device: &wgpu::Device, 
+           surface_format: wgpu::TextureFormat) -> Self {
+        let egui_ctx = egui::Context::default();
+        let egui_winit = egui_winit::State::new(
+            egui_ctx.clone(), egui::ViewportId::ROOT, window, None, None, None,
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(
+            device, surface_format, None, 1, false,
+        );
+        Self { egui_ctx, egui_winit, egui_renderer }
+    }
+    
+    fn handle_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
+        // Returns true if egui consumed the event
+        self.egui_winit.on_window_event(window, event).consumed
+    }
+}
+Every frame, between your terminal rendering and presenting, you run the egui pass:
+
+rust
+// In render_frame, after terminal drawing, before submit:
+
+let raw_input = self.ui.egui_winit.take_egui_input(&self.window);
+let full_output = self.ui.egui_ctx.run(raw_input, |ctx| {
+    draw_ui(ctx, state, &mut actions);  // your UI code
+});
+
+self.ui.egui_winit.handle_platform_output(&self.window, full_output.platform_output);
+
+let tris = self.ui.egui_ctx.tessellate(full_output.shapes, 
+                                         full_output.pixels_per_point);
+
+for (id, delta) in &full_output.textures_delta.set {
+    self.ui.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
+}
+
+self.ui.egui_renderer.update_buffers(&self.device, &self.queue, &mut encoder, 
+                                      &tris, &screen_descriptor);
+
+// In the same render pass as terminals, after terminal draws:
+self.ui.egui_renderer.render(&mut pass, &tris, &screen_descriptor);
+
+for id in &full_output.textures_delta.free {
+    self.ui.egui_renderer.free_texture(id);
+}
+The key insight: egui draws on top of your terminals in the same render pass. It uses alpha blending, so you can have semi-transparent overlays (settings panels, dialogs) and they'll composite correctly over the terminal grid.
+
+Event routing: the critical decision
+Input events are the hardest part. Who gets each event — egui or the focused terminal? The correct order:
+
+First, offer the event to egui. If egui's on_window_event returns consumed: true, stop. The user clicked on the strip or is typing in a rename field.
+Otherwise, if it's a keyboard event, route to the focused tile's PTY.
+Otherwise, if it's a mouse event within a terminal's bounds, handle terminal mouse interaction (selection, scroll, click-through focus).
+Otherwise, let the event loop handle it (window resize, close, etc.).
+The subtlety: focus. egui has its own focus model for its widgets. Your tiles have a focus model for which one gets keystrokes. These must not conflict. The rule: if egui reports a widget has focus (text field being edited), egui gets keystrokes. Otherwise, the focused tile does.
+
+rust
+fn route_keyboard(&mut self, event: &KeyEvent) {
+    if self.ui.egui_ctx.wants_keyboard_input() {
+        // egui has a focused text field; it already got the event
+        return;
+    }
+    
+    if let Some(tile_id) = self.app_state.focused_tile {
+        self.pty_manager.send_key(tile_id, event);
+    }
+}
+wants_keyboard_input() and wants_pointer_input() are your two main coordination functions. Use them religiously.
+
+Drawing the strip
+The strip is pure egui — a TopBottomPanel::top with custom-painted cards inside. Here's the sketch:
+
+rust
+fn draw_strip(ctx: &egui::Context, state: &AppState, actions: &mut Vec<Action>) {
+    egui::TopBottomPanel::top("workspace_strip")
+        .exact_height(56.0)
+        .frame(egui::Frame::none().fill(ctx.style().visuals.window_fill))
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                for (idx, workspace) in state.workspaces.iter().enumerate() {
+                    draw_card(ui, workspace, 
+                             idx == state.active_workspace_idx(), 
+                             actions);
+                }
+                
+                // "+" button to add workspace
+                if ui.add(egui::Button::new("+").min_size(egui::vec2(32.0, 48.0))).clicked() {
+                    actions.push(Action::CreateWorkspace);
+                }
+            });
+        });
+}
+
+fn draw_card(ui: &mut egui::Ui, workspace: &Workspace, is_active: bool, 
+             actions: &mut Vec<Action>) {
+    let card_size = egui::vec2(140.0, 48.0);
+    let (rect, response) = ui.allocate_exact_size(card_size, 
+                                                   egui::Sense::click_and_drag());
+    
+    let painter = ui.painter();
+    let bg_color = if is_active { 
+        ui.style().visuals.selection.bg_fill 
+    } else { 
+        ui.style().visuals.widgets.inactive.bg_fill 
+    };
+    painter.rect_filled(rect, 6.0, bg_color);
+    
+    // Draw label
+    painter.text(
+        rect.left_top() + egui::vec2(8.0, 6.0),
+        egui::Align2::LEFT_TOP,
+        &workspace.label,
+        egui::FontId::proportional(13.0),
+        ui.style().visuals.text_color(),
+    );
+    
+    // Draw mini tile indicators
+    let indicator_y = rect.bottom() - 12.0;
+    for (i, tile) in workspace.tiles.iter().enumerate().take(6) {
+        let x = rect.left() + 8.0 + (i as f32) * 10.0;
+        let dot_color = if tile.has_new_output {
+            egui::Color32::from_rgb(100, 200, 100)
+        } else {
+            ui.style().visuals.weak_text_color()
+        };
+        painter.circle_filled(egui::pos2(x, indicator_y), 3.0, dot_color);
+    }
+    
+    if response.clicked() {
+        actions.push(Action::SwitchWorkspace(workspace.id));
+    }
+    
+    if response.double_clicked() {
+        actions.push(Action::StartRenaming(workspace.id));
+    }
+}
+This is illustrative — real code gets fiddlier with hover states, drag visualization, and accessibility. But the shape is right: egui gives you primitives (allocate_exact_size, painter, Sense::click_and_drag), and you compose them.
+
+Drag and drop: the fun part
+This is where egui earns its keep. Built-in drag handling is ergonomic:
+
+rust
+// In the tile being dragged:
+let response = ui.interact(tile_rect, tile_id, egui::Sense::drag());
+
+if response.drag_started() {
+    ui.ctx().set_dragged_id(tile_id);
+    // Store what's being dragged (e.g., in a resource)
+    ui.ctx().memory_mut(|mem| {
+        mem.data.insert_temp(egui::Id::new("dragged_tile"), tile.id);
+    });
+}
+
+if response.dragged() {
+    // Draw a ghost following the cursor
+    if let Some(pos) = ui.ctx().pointer_interact_pos() {
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip, egui::Id::new("drag_ghost")
+        ));
+        painter.rect_filled(
+            egui::Rect::from_center_size(pos, egui::vec2(120.0, 80.0)),
+            4.0,
+            egui::Color32::from_rgba_premultiplied(100, 100, 100, 180),
+        );
+    }
+}
+
+// In the drop target (a workspace card):
+if response.hovered() && ui.ctx().dragged_id().is_some() {
+    // Highlight the card as drop target
+    painter.rect_stroke(rect, 6.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+}
+
+if response.drag_stopped_on(card_id) {
+    if let Some(tile_id) = ui.ctx().memory(|mem| 
+        mem.data.get_temp::<TileId>(egui::Id::new("dragged_tile"))
+    ) {
+        actions.push(Action::MoveTile { 
+            tile_id, 
+            target_workspace: workspace.id 
+        });
+    }
+}
+egui handles the event plumbing (mouse down, move, up across widgets) — you just declare intent.
+
+The action pattern
+Notice I keep passing actions: &mut Vec<Action> around. This is deliberate. UI code should never mutate AppState directly — that creates a tangle where the UI is reading state that it's simultaneously modifying, and it makes testing impossible.
+
+Instead, UI draws against a read-only &AppState, pushes Actions into a vec, and after the UI pass completes, you drain the vec and apply each action to the state:
+
+rust
+pub enum Action {
+    SwitchWorkspace(WorkspaceId),
+    CreateWorkspace,
+    RenameWorkspace { id: WorkspaceId, new_label: String },
+    MoveTile { tile_id: TileId, target_workspace: WorkspaceId },
+    FocusTile(TileId),
+    CloseTile(TileId),
+    SetLayout(Layout),
+    ToggleZenMode,
+    ToggleFollowMode(TileId),
+    // ...
+}
+
+fn apply_action(state: &mut AppState, pty_manager: &mut PtyManager, action: Action) {
+    match action {
+        Action::SwitchWorkspace(id) => {
+            state.active_workspace = id;
+            // update focused tile if needed
+        }
+        Action::MoveTile { tile_id, target_workspace } => {
+            let tile = state.remove_tile(tile_id);
+            state.workspace_mut(target_workspace).tiles.push(tile);
+        }
+        // ...
+    }
+}
+This pattern gives you three free things: every user interaction is a serializable event (hello, undo/redo and session replay); state mutations are localized to one function (easy to audit); testing is trivial (construct state, apply action, assert).
+
+The visual polish pass
+egui's defaults are functional but not beautiful. Budget time for a style pass once the app works. Key knobs:
+
+ctx.style_mut().visuals.widgets.* — control colors for inactive/hovered/active widgets
+ctx.style_mut().spacing.item_spacing — tighten or loosen layout
+Custom fonts via ctx.set_fonts — match your terminal font family for the strip, or use a UI font
+Frame::none().fill(...).rounding(...) — card backgrounds with rounded corners
+Animation via ctx.request_repaint_after(Duration::from_millis(16)) during transitions
+The goal: the strip should feel like it belongs with the terminals, not like a generic immediate-mode GUI slapped on top. This is mostly matching colors and spacing to your terminal theme.
+
+Performance notes on egui
+egui re-tessellates every frame. For a simple strip with 5-10 cards, this is nothing — sub-millisecond. It becomes a concern if you put the entire terminal rendering inside egui (don't) or if you have hundreds of animated widgets (you won't). For your design, egui's overhead will be 0.5-2ms per frame, which is invisible at 60fps.
+
+One gotcha: egui continuously repaints while the mouse is over an interactive widget. This prevents your "idle at 0% CPU" goal when the cursor is in the strip. This is usually fine (the cursor isn't in the strip most of the time), but if it bothers you, you can override with ctx.request_repaint_after logic.
+
+What to build next
+Now that render and UI layers are mapped, the remaining unanswered questions are smaller and more concrete:
+
+Config format and hot reload — probably TOML with notify for file watching. Straightforward.
+Theme system — data model for themes, loading from files, live switching.
+Keybinding system — how users bind actions to keys, conflict resolution.
+Workspace templates — the format, how they're triggered, how they interact with the PTY spawn.
+Search UI — both in-tile and cross-tile search, probably using ropey or similar for the scrollback buffer.
+None of these are architectural decisions that will bite you later — they're features you can bolt on as the core stabilizes. The render pipeline and UI integration are the two places where getting it wrong means rewriting the world, and both are now pinned down.
+
+Want to pick one of those remaining areas, or should we start writing actual code? At this point we have enough design that I could sketch focusterm-core with real types and a working layout computation, which would give you something to run cargo check against and build outward from.
+
+Small new goal: each window, if enabled per window, would be a separate git worktree of the project it was in. Is this feasible?
+
+Other that that new wrinkle, what would you say the remaining tasks are?
+
+11:54 PM
+Short answer: yes, very feasible, and it's a genuinely great fit for Claude Code workflows. Let me address the worktree question seriously, then give you the honest state of remaining tasks.
+
+Git worktrees per tile: the design
+This is actually the killer feature for the Claude Code use case. Here's why it fits: you often want to let Claude work on a feature while you continue on main, or run three Claude sessions exploring three different approaches to the same problem without stepping on each other. Worktrees are git's built-in answer to exactly this, but they're annoying to manage manually. Baking them into tile creation makes the whole workflow disappear into the UI.
+
+Mental model
+A tile in "worktree mode" has:
+
+A source repository (the "real" repo the user opened)
+A worktree path (somewhere under a managed directory, e.g. ~/.focusterm/worktrees/<repo>-<tile_id>/)
+A branch (either auto-created like focusterm/tile-abc123 or user-named)
+A base reference (what the worktree was created from — usually HEAD, a named branch, or a specific commit)
+The tile's PTY has its CWD set to the worktree path. Everything else — the shell, Claude Code, git commands — just works, because from the process's perspective it's in a normal git repository.
+
+The lifecycle
+On tile creation with worktree enabled:
+
+1. User toggles "worktree" when creating a tile in a repo
+2. Generate branch name (default: focusterm/{workspace-label}-{short-id})
+3. Run: git -C <repo> worktree add <worktree-path> -b <branch> <base-ref>
+4. Spawn PTY with CWD = <worktree-path>
+5. Store worktree metadata in tile state
+During tile life:
+
+Tile just works like a normal terminal in a repo
+Optionally surface git status in the UI (changed files count on the tile, branch name in the strip card)
+On tile close:
+
+Check for uncommitted changes
+If clean: prompt to merge back / push / discard / keep worktree
+If dirty: warn loudly, default to keeping the worktree so nothing is lost
+Run git worktree remove only if user confirms
+Why this is tractable
+You don't implement git. You shell out to git as a subprocess for the structural operations. The git2 crate is tempting and you might reach for it for status queries (it's faster than shelling out for repeated calls), but for worktree creation/removal, subprocess calls to the system git are safer — they handle every edge case git itself handles, including hooks, config, and weird repo layouts. Correctness beats a few milliseconds.
+
+A minimal worktree manager:
+
+rust
+// focusterm-core/src/worktree.rs
+
+pub struct WorktreeConfig {
+    pub source_repo: PathBuf,
+    pub branch_name: String,
+    pub base_ref: String,  // "HEAD", "main", "abc123", etc.
+    pub cleanup_on_close: CleanupPolicy,
+}
+
+pub enum CleanupPolicy {
+    Always,          // remove worktree on tile close (if clean)
+    Never,           // keep worktree around
+    Prompt,          // ask user on close
+}
+
+pub struct Worktree {
+    pub config: WorktreeConfig,
+    pub path: PathBuf,
+    pub created_at: SystemTime,
+}
+
+impl Worktree {
+    pub fn create(config: WorktreeConfig, base_dir: &Path) -> Result<Self> {
+        let worktree_path = base_dir.join(format!(
+            "{}-{}", 
+            config.source_repo.file_name().unwrap().to_string_lossy(),
+            random_id(6),
+        ));
+        
+        let output = Command::new("git")
+            .arg("-C").arg(&config.source_repo)
+            .arg("worktree").arg("add")
+            .arg(&worktree_path)
+            .arg("-b").arg(&config.branch_name)
+            .arg(&config.base_ref)
+            .output()?;
+        
+        if !output.status.success() {
+            return Err(WorktreeError::GitFailed(
+                String::from_utf8_lossy(&output.stderr).into_owned()
+            ));
+        }
+        
+        Ok(Worktree {
+            config,
+            path: worktree_path,
+            created_at: SystemTime::now(),
+        })
+    }
+    
+    pub fn status(&self) -> Result<WorktreeStatus> {
+        // git -C <path> status --porcelain=v2 --branch
+        // parse output for dirty/clean, ahead/behind, staged counts
+    }
+    
+    pub fn remove(&self, force: bool) -> Result<()> {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(&self.config.source_repo)
+           .arg("worktree").arg("remove");
+        if force { cmd.arg("--force"); }
+        cmd.arg(&self.path);
+        
+        let output = cmd.output()?;
+        if !output.status.success() {
+            return Err(WorktreeError::GitFailed(/* ... */));
+        }
+        Ok(())
+    }
+}
+The gotchas specific to worktrees
+Detecting the repo root. When a user enables worktree mode for a tile, you need to know what repo they're in. Run git -C <cwd> rev-parse --show-toplevel and use the output. If it fails, the tile is not in a repo — surface that error and don't show the worktree toggle.
+
+Branch naming collisions. If the user creates a tile, closes it without cleanup, then creates another with the same default name, git worktree add -b will fail. Either include a short random suffix in auto-generated names (what I'd do) or detect collision and increment.
+
+Submodules. If the parent repo has submodules, git worktree add doesn't automatically init them in the new worktree. If you care, run git submodule update --init --recursive after creation. For v1, document the limitation and move on.
+
+Hooks. .git/hooks is not shared across worktrees — each worktree has its own hooks directory. If a user's team relies on pre-commit hooks installed via some tool, they'll need to reinstall in the worktree. This is a git quirk, not yours to fix, but worth mentioning in your docs.
+
+Disk space. Worktrees share git objects (that's the whole point), but working files are separate copies. Six worktrees of a 500MB repo = 3GB of working files. Not huge, but worth surfacing in the UI when worktrees accumulate.
+
+Cleanup of orphaned worktrees. If your app crashes mid-session, worktrees are left behind. Git knows about them via git worktree list — so on startup, scan for worktrees your app created (recognizable by path prefix or a marker file you drop) and offer to clean them up. Don't auto-delete; users might have uncommitted work.
+
+Merging back. The UX question: when a user is "done" with a worktree tile, how do they get their work back into the main branch? Options range from "do it yourself in the other tile" (simplest) to a guided merge/PR flow (complicated). I'd start with a "Copy branch name" button and let users handle merging in their main tile. Add automation later if there's demand.
+
+UI integration
+In the tile creation flow (a "+" button or Cmd+T), show a small toggle: "Create as worktree". When enabled, reveal:
+
+Branch name (editable, with a sensible default)
+Base branch dropdown (populated from git branch -a)
+On the tile itself, show a subtle branch indicator — something like ⎇ focusterm/tile-abc123 in a corner, maybe with dirty state (● if uncommitted changes). In the strip card, include the branch name if the worktree is the notable thing about that tile.
+
+Poll git status --porcelain every 2-3 seconds per active worktree tile to update the dirty indicator. Cheap enough.
+
+The Claude Code angle
+The reason this feature is worth its weight: users will create workspaces like "Exploring auth refactor" with three tiles, each a worktree on a different branch, each with its own Claude Code session trying a different approach. At the end, they look at all three, pick the winner, and discard the others. This workflow doesn't really exist in any other tool, and it's what the whole "focused mode" framing is actually for.
+
+Lean into it. Consider a "fork this tile" action: take an existing worktree tile, spawn a new one based on the same branch, so you can try two variations from a common starting point. That's a five-line feature that looks like magic.
+
+Remaining tasks: the honest list
+Let me inventory where we are vs. what's left. Grouped by phase.
+
+Architecture and scope (done)
+Stack chosen (Rust + wgpu + alacritty_terminal + glyphon + egui)
+Crate structure mapped
+Core domain types sketched
+Render pipeline designed
+egui integration pattern pinned down
+UX model defined (workspaces, tiles, strip, cards, drag-to-move)
+Worktree model just defined above
+Design questions still open
+These are decisions you need to make before or during coding, and they're not architectural — they're product decisions:
+
+Config format and loading. TOML is the default answer, serde + toml crate. Location: ~/.config/focusterm/config.toml on Linux/macOS (XDG-compliant via directories crate), %APPDATA%\focusterm\config.toml on Windows. Hot reload via notify. Decide: what's configurable (keybindings, themes, fonts, default layout, worktree base dir) and what's not.
+
+Keybinding system. A map from KeyCombo → Action. KeyCombo is a (Modifiers, Key) tuple. Action is the enum from before. Build a small parser for strings like "Cmd+Shift+1" → KeyCombo. Decide: how to resolve conflicts (first match wins, or fail at config load).
+
+Theme system. A Theme struct (foreground, background, 16 ANSI, cursor, UI accent) serializable from TOML. Ship Catppuccin/Tokyo Night/Solarized. Decide: one theme for everything, or separate UI theme and terminal theme (I'd pick one for v1).
+
+Workspace templates. Format probably like:
+
+toml
+[[templates]]
+name = "Rust project"
+layout = { cols = 3, rows = 2 }
+[[templates.tiles]]
+cwd = "."
+command = "cargo watch -x test"
+[[templates.tiles]]
+cwd = "."
+command = ""  # just shell
+[[templates.tiles]]
+cwd = "."
+command = "claude"
+worktree = true
+Decide: how users invoke templates (command palette, right-click on "+", CLI arg).
+
+Search. Two levels: in-tile scrollback search (Cmd+F) and cross-tile (Cmd+Shift+F). alacritty_terminal has its own RegexSearch. Cross-tile is a loop over tiles with result aggregation. Decide: regex vs. plain text, case sensitivity UI.
+
+Session persistence. What restores on relaunch? Layout structure, workspace labels, tile CWDs, window size/position. What doesn't? Running processes (can't), scrollback history (could, but probably not v1). Decide: opt-in or automatic.
+
+Implementation work remaining
+Rough effort estimates assuming a focused developer working solo:
+
+Phase 1 — Single tile working end-to-end (3-5 days)
+
+Set up workspace and crates (few hours)
+focusterm-core with types and layout math (half day)
+focusterm-pty spawning one PTY, reading bytes (half day)
+Wire alacritty_terminal state machine (half day)
+focusterm-render minimal viable: one tile, glyph text, cursor (1-2 days)
+Keyboard input to PTY (few hours)
+Resize handling (few hours)
+Phase 2 — Multi-tile and layouts (2-3 days)
+
+N tiles in a grid, tile rectangles from layout (half day)
+Focus model and focus switching (few hours)
+Per-tile resize propagation to PTYs (few hours)
+Mouse click-to-focus and per-tile mouse event routing (half day)
+Tile borders, focused tile indicator (few hours)
+Layout presets and switching (half day)
+Phase 3 — Strip and workspaces (3-4 days)
+
+egui integration, blank strip rendering (half day)
+Cards with labels, active highlight, click to switch (half day)
+Multi-workspace state management, switching (half day)
+Activity indicators on cards (few hours)
+Workspace rename (few hours)
+Drag to reorder workspaces (half day)
+Drag tile between workspaces (1 day — the finicky one)
+"+" to add workspace, close workspace (few hours)
+Phase 4 — Terminal UX essentials (2-3 days)
+
+Mouse text selection (half day)
+Clipboard copy/paste integration via arboard (few hours)
+Scrollback navigation (mouse wheel, keyboard) (half day)
+In-tile search with alacritty_terminal::RegexSearch (half day)
+Bell handling and visual indication (few hours)
+OSC sequences (title changes, hyperlinks) (half day)
+Phase 5 — Polish and config (2-3 days)
+
+Config file load and hot reload (half day)
+Keybinding system with config-driven bindings (half day)
+Theme system with loading from files (half day)
+Font configuration and live switching (few hours)
+Zen mode (few hours)
+Output-aware dimming of inactive tiles (few hours)
+Phase 6 — Worktrees (2 days)
+
+focusterm-core::worktree module (half day)
+Tile creation flow with worktree toggle (half day)
+Status polling and indicators (few hours)
+Cleanup on close with prompts (few hours)
+Orphan detection on startup (few hours)
+Phase 7 — Cross-tile and templates (2-3 days)
+
+Cross-tile search UI (half day)
+Workspace templates format and loader (half day)
+Template invocation UI (few hours)
+"Follow" mode per tile (few hours)
+"Fork this tile" for worktree tiles (few hours)
+Phase 8 — Distribution (2-3 days, platform-dependent)
+
+macOS: code signing, notarization, DMG packaging (1 day if you've done it before, 2 if not)
+Linux: AppImage or deb/rpm (half day)
+Windows: MSI or portable exe (half day)
+Auto-update: out of scope for v1, honestly
+Total: roughly 18-26 days of focused work for a polished v1. Call it 4-6 weeks of real calendar time accounting for the usual distractions and the inevitable rabbit holes (fonts will take longer than you think, drag-and-drop will take longer than you think, at least one wgpu bug will eat a day).
+
+The honest risk list
+Things most likely to surprise you:
+
+Font rendering edge cases. Emoji, CJK, powerline glyphs, zero-width joiners. cosmic-text handles these but you'll hit weird cases. Test with a torture file early.
+Mouse selection. Multi-line selection with proper wrapping semantics, selection across scrollback boundary, double-click-word and triple-click-line. This consistently takes 2-3x longer than expected in every terminal project.
+macOS-specific input quirks. Dead keys, IME for CJK input, Cmd vs. Ctrl semantics. Plan time for this.
+Performance under pathological load. yes piped to itself, find /, cat large-log.txt. Easy to get right with the coalescing design we discussed, easy to get wrong if you route every byte through a channel.
+wgpu version churn. wgpu still has breaking changes between versions. Pin your version and don't upgrade casually mid-project.
+What I'd actually recommend doing next
+Two options, pick one:
+
+Option A: Start writing code. I can sketch focusterm-core with real, compilable types — AppState, Workspace, Tile, Layout, layout rectangle computation with unit tests. You run cargo check and cargo test, we iterate. This is the shortest path from design to running software.
+
+Option B: Nail down the remaining design questions first. Config format, keybinding scheme, theme format, template format. These are small individually but they constrain implementation. Doing them now means less churn later.
+
+I lean toward A — the design questions in B are genuinely small and you'll design them better once you have code to test against. But it depends on how you work. Which do you want to do?
+
+Yes, let's start with A. We're going to transition over to claude code now. Can you write this all up in markdown in a way that claude code can consume? Please be as detailed and thorough as possible to capture the nuance of the conversation.
+
+Apr 17
+I'll write this up as a comprehensive handoff document. Let me create it as a markdown file.
+
+
+Ran 2 commands, created a file, read a file
+Ran 2 commands, created a file, read a file
+Handoff document is ready — ~1,100 lines covering everything from vision through first-commit instructions.
+
+Structure, in case you want to point Claude Code at specific sections:
+
+Product vision (including non-goals)
+Technology stack with per-crate rationale
+UX design (strip, cards, tile grid, keybindings)
+Git worktree integration
+Architecture (concurrency domains, crate layout, core types, action pattern, main loop)
+Render pipeline deep dive
+egui UI layer deep dive
+Phased implementation roadmap with effort estimates
+Known risks and gotchas
+Open design questions (explicitly deferrable)
+Getting-started first-commit file structure
+Glossary
+A few things I deliberately did for Claude Code's benefit:
+
+Rationale lives next to decisions. Every non-obvious choice has a "why" so Claude Code can revisit with context rather than guessing.
+Phases have exit criteria, not just task lists, so it knows when to stop and move on.
+The "gotchas" section is specific, not generic. Surface resize races, PTY resize signaling order, font loading on startup, worktree orphans — the things that actually bite.
+Section 11 gives a concrete first commit so there's no "where do I start" ambiguity.
+One practical suggestion when you fire up Claude Code: drop this file at the repo root as FOCUSTERM.md or DESIGN.md and reference it in your initial prompt. Something like "Read FOCUSTERM.md end to end, then execute Phase 1 step 1 (workspace setup) and Phase 1 step 2 (focusterm-core with unit tests). Stop after tests pass for review." Gives you natural checkpoints.
+
+Good luck — this is going to be fun to build.
+
+
+Focusterm
+Document · MD 
+One thing: this name of this is "Kookaburra". And it has a little kookaburra logo. You can design it. It should be 1 bit, all white.
+
+12:03 AM
+Nice name — kookaburras are loud, focused, and distinctly recognizable, which is a good vibe for a focused-mode terminal. Let me sketch a logo and then update the doc.
+
+
+
+The design intent: a side profile showing the kookaburra's defining silhouette — that oversized head, the long heavy beak (their most recognizable feature), compact body, tail feathers, perched on a short branch. Built on an 8-pixel grid so it reads as intentionally low-fi / terminal-native. The single pixel gap at the head creates the eye. 1-bit = pure white on whatever background, no anti-aliasing, no grays.
+
+Let me save this as a proper asset file and update the handoff doc.
+
+
+Save the kookaburra logo as a standalone SVG asset
+Save the kookaburra logo as a standalone SVG asset
+Now let me update the handoff doc to rename the project throughout and add logo/branding guidance.
+
+
+Duplicate the doc under the new name and rename references
+Duplicate the doc under the new name and rename references
+Good. Now let me add a branding/assets section near the top and update the getting-started section to include the logo.
+
+
+Add a naming & branding section right after the product vision
+Add a naming & branding section right after the product vision
+Now let me update the "Getting started: first commit" section to include the assets directory with the logo in it.
+
+
+Update the first-commit file tree to include the logo asset
+Update the first-commit file tree to include the logo asset
+Let me also update the workspace layout section earlier in the doc to show the assets directory:
+
+
+Update the architecture crate layout to include assets directory with logo
+Update the architecture crate layout to include assets directory with logo
+Now let me copy everything to outputs and present the final files:
+
+
+Stage both files in outputs, verify no old name stragglers
+Stage both files in outputs, verify no old name stragglers
+Clean — no old name stragglers, both files staged.
+
+
+Presented 2 files
+Presented 2 files
+Done. Two files:
+
+KOOKABURRA.md — the full handoff, renamed throughout (crate names, binary name, all prose references). I added a new branding subsection in section 1 covering the name rationale, the 1-bit design constraints (pure white, crisp edges, transparent background, no gradients), and the required asset derivatives you'll want for packaging (.icns for macOS, .ico for Windows, PNGs for everything else). The workspace layout in the architecture section and the first-commit tree now both include assets/logo/.
+
+kookaburra.svg — the standalone 320×320 logo asset, white-on-transparent, ready to drop into assets/logo/kookaburra.svg. For the raster derivatives, an easy one-liner once you have the project set up:
+
+sh
+for size in 32 64 128 256 512; do
+  rsvg-convert -w $size -h $size assets/logo/kookaburra.svg \
+    -o assets/logo/kookaburra-$size.png
+done
+(Or use inkscape --export-type=png --export-width=$size if you prefer.)
+
+One small note on the logo for Claude Code to keep in mind: the 1-bit pixel aesthetic is load-bearing. If it ever needs a dark-mode variant or a filled-background variant (e.g., for a colored dock badge), the rule is "invert to pure black on white," never introduce grays or colors. The whole point is that it reads as terminal-native at any size down to a 16×16 favicon.
+
+Good luck with the build — Kookaburra is a great name for this.
+
+
+Kookaburra
+Document · MD 
+
+Kookaburra
+Image · SVG 
+Thank you for your service
+
+12:06 AM
+Ha, you're welcome. This was a genuinely fun one to think through — the combination of "max performance" constraints, the worktree-per-tile insight, and a cute bird logo at the end is a rare trifecta.
+
+Good luck with Kookaburra. If you hit snags during implementation — a weird wgpu issue, a design question that didn't get resolved in the doc, a font rendering nightmare — come back and we'll work through it. And if it ships, I'd love to hear how it turns out.
+
+Go build.
+
+
