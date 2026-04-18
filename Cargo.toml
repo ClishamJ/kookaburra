@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kookaburra-core",
+    "crates/kookaburra-pty",
+    "crates/kookaburra-render",
+    "crates/kookaburra-ui",
+    "crates/kookaburra-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/destromachine/kookaburra"
+authors = ["Destro <poorlittlepigeon@gmail.com>"]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
