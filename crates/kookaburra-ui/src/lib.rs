@@ -563,7 +563,7 @@ fn logo_placeholder(ui: &mut egui::Ui) {
     let t = ui.ctx().input(|i| i.time);
 
     // koo-idle-bob: gentle 1px sine bob (2s period).
-    let bob = -1.0 * ((t * std::f64::consts::TAU / 2.0).sin() as f32);
+    let bob = -((t * std::f64::consts::TAU / 2.0).sin() as f32);
 
     // koo-peck: a subtle forward-tilt every 1.6s. The design uses
     // `transformOrigin: 40% 70%` with a rotation, which we approximate as
