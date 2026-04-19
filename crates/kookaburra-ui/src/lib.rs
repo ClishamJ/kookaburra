@@ -20,7 +20,8 @@ use winit::event::WindowEvent;
 use winit::window::Window;
 
 use kookaburra_core::action::Action;
-use kookaburra_core::ids::WorkspaceId;
+use kookaburra_core::ids::{TileId, WorkspaceId};
+use kookaburra_core::layout::{compute_tile_rects, Rect as CoreRect};
 use kookaburra_core::state::{AppState, Workspace};
 
 /// Bytes arriving on a tile within this window treat it as "actively
@@ -58,6 +59,17 @@ const ACCENT_DEEP: Color32 = Color32::from_rgb(0xc2, 0x56, 0x00);   // darker be
 const TEAL: Color32 = Color32::from_rgb(0x48, 0xb7, 0xbd);          // worktree
 const GREEN: Color32 = Color32::from_rgb(0x6e, 0xd2, 0x74);         // activity dot
 const GRID_LINE: Color32 = Color32::from_rgb(0x1a, 0x15, 0x10);     // gridLine (very subtle)
+/// Fill for empty tile slots: 92% STRIP_BG + 8% FG. Muted but visible so
+/// the grid reads as "dormant, click to wake" rather than "empty void".
+const EMPTY_SLOT_FILL: Color32 = Color32::from_rgb(0x1a, 0x18, 0x16);
+
+/// Inner padding around each empty-slot overlay in logical pixels. Mirrors
+/// the TILE_GAP used by the terminal renderer so empty and live tiles sit
+/// on the same visual grid.
+const EMPTY_SLOT_GAP: f32 = 6.0;
+/// Below this physical-pixel slot height the "click or press ⏎" subtitle
+/// overlaps the "+" glyph, so we hide it.
+const EMPTY_SLOT_SUBTITLE_MIN_HEIGHT: f32 = 80.0;
 
 /// Routing decision for an input event.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -320,7 +332,15 @@ impl UiLayer {
             // central area (what's left after the strip + status bar
             // panels) so the app can size terminals into exactly this
             // space.
-            central = Some(ctx.available_rect());
+            let area = ctx.available_rect();
+            central = Some(area);
+            // Empty-slot placeholders paint into the central area on top
+            // of the cleared-to-black wgpu frame. Only non-live slots get
+            // an overlay, so live tiles remain free for the terminal
+            // mouse path. Zen mode hides everything but the focused tile.
+            if !state.zen_mode {
+                paint_empty_slots(ctx, state, actions, area);
+            }
         });
         self.central_rect = central;
         self.wants_keyboard = ctx.wants_keyboard_input();
@@ -1153,6 +1173,103 @@ fn resolve_reorder(
         }
         *reorder = None;
     }
+}
+
+/// Paint an egui overlay (rounded fill + outline + "+" glyph + subtitle)
+/// for every empty slot in the active workspace, and register click
+/// hit-boxes that promote the slot via `SpawnInTile`. Live slots are
+/// skipped so terminal mouse interactions in their rects fall through
+/// to the app's existing terminal mouse path.
+fn paint_empty_slots(
+    ctx: &egui::Context,
+    state: &AppState,
+    actions: &mut Vec<Action>,
+    area: egui::Rect,
+) {
+    let ws = state.active_workspace();
+    let core_area = CoreRect {
+        x: area.left(),
+        y: area.top(),
+        width: area.width(),
+        height: area.height(),
+    };
+    let rects = compute_tile_rects(ws.layout, core_area);
+    for (i, tile) in ws.tiles.iter().enumerate() {
+        if tile.is_live() {
+            continue;
+        }
+        let Some(r) = rects.get(i).copied() else {
+            break;
+        };
+        let slot = egui::Rect::from_min_size(
+            egui::pos2(
+                r.x + EMPTY_SLOT_GAP * 0.5,
+                r.y + EMPTY_SLOT_GAP * 0.5,
+            ),
+            egui::vec2(
+                (r.width - EMPTY_SLOT_GAP).max(1.0),
+                (r.height - EMPTY_SLOT_GAP).max(1.0),
+            ),
+        );
+        let focused = state.focused_tile == Some(tile.id);
+        paint_empty_slot(ctx, actions, tile.id, slot, focused);
+    }
+}
+
+/// Paint a single empty-slot overlay and handle its click interaction.
+/// Uses an `egui::Area` so input only fires within the slot rect — which
+/// means clicks inside live tile rects fall through to the terminal.
+fn paint_empty_slot(
+    ctx: &egui::Context,
+    actions: &mut Vec<Action>,
+    tile_id: TileId,
+    slot: egui::Rect,
+    focused: bool,
+) {
+    let area_id = egui::Id::new(("kb-empty-slot", tile_id.raw()));
+    egui::Area::new(area_id)
+        .order(egui::Order::Background)
+        .fixed_pos(slot.min)
+        .movable(false)
+        .interactable(true)
+        .show(ctx, |ui| {
+            let (rect, response) = ui.allocate_exact_size(slot.size(), Sense::click());
+            let painter = ui.painter();
+            let rounding = Rounding::same(6.0);
+            painter.rect_filled(rect, rounding, EMPTY_SLOT_FILL);
+            let stroke = if focused {
+                Stroke::new(1.5, ACCENT)
+            } else {
+                Stroke::new(1.0, GRID_LINE)
+            };
+            painter.rect_stroke(rect, rounding, stroke);
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "+",
+                FontId::proportional(28.0),
+                FG_DIM,
+            );
+            if rect.height() > EMPTY_SLOT_SUBTITLE_MIN_HEIGHT {
+                let sub = egui::pos2(rect.center().x, rect.center().y + 24.0);
+                painter.text(
+                    sub,
+                    egui::Align2::CENTER_CENTER,
+                    "click or press ⏎",
+                    FontId::proportional(11.0),
+                    FG_FAINT,
+                );
+            }
+            if response.clicked() {
+                // Focus first so if the spawn fails for any reason the
+                // user can still press Enter on the focused slot.
+                actions.push(Action::FocusTile(tile_id));
+                actions.push(Action::SpawnInTile {
+                    tile_id,
+                    worktree: None,
+                });
+            }
+        });
 }
 
 #[cfg(test)]
