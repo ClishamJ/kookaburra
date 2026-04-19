@@ -46,19 +46,19 @@ pub const STATUS_BAR_HEIGHT: f32 = 22.0;
 /// Kookaburra warm amber palette — OKLCH-derived from
 /// `docs/design/Kookaburra/data.js`. Background is near-black with a
 /// warm tint; amber (`ACCENT`) is the signature kookaburra highlight.
-const STRIP_BG: Color32 = Color32::from_rgb(0x08, 0x06, 0x04);      // bg (near-black)
-const BG_DEEP: Color32 = Color32::from_rgb(0x04, 0x03, 0x02);       // bgDeep
-const BG_DIM: Color32 = Color32::from_rgb(0x12, 0x0d, 0x09);        // bgDim (active card)
-const FG: Color32 = Color32::from_rgb(0xee, 0xeb, 0xe5);            // fg
-const FG_DIM: Color32 = Color32::from_rgb(0x9c, 0x98, 0x90);        // fgDim
-const FG_FAINT: Color32 = Color32::from_rgb(0x61, 0x5d, 0x56);      // fgFaint
-const ACCENT: Color32 = Color32::from_rgb(0xff, 0xa5, 0x1c);        // kookaburra amber
+const STRIP_BG: Color32 = Color32::from_rgb(0x08, 0x06, 0x04); // bg (near-black)
+const BG_DEEP: Color32 = Color32::from_rgb(0x04, 0x03, 0x02); // bgDeep
+const BG_DIM: Color32 = Color32::from_rgb(0x12, 0x0d, 0x09); // bgDim (active card)
+const FG: Color32 = Color32::from_rgb(0xee, 0xeb, 0xe5); // fg
+const FG_DIM: Color32 = Color32::from_rgb(0x9c, 0x98, 0x90); // fgDim
+const FG_FAINT: Color32 = Color32::from_rgb(0x61, 0x5d, 0x56); // fgFaint
+const ACCENT: Color32 = Color32::from_rgb(0xff, 0xa5, 0x1c); // kookaburra amber
 #[allow(dead_code)]
-const ACCENT_DEEP: Color32 = Color32::from_rgb(0xc2, 0x56, 0x00);   // darker beak
+const ACCENT_DEEP: Color32 = Color32::from_rgb(0xc2, 0x56, 0x00); // darker beak
 #[allow(dead_code)]
-const TEAL: Color32 = Color32::from_rgb(0x48, 0xb7, 0xbd);          // worktree
-const GREEN: Color32 = Color32::from_rgb(0x6e, 0xd2, 0x74);         // activity dot
-const GRID_LINE: Color32 = Color32::from_rgb(0x1a, 0x15, 0x10);     // gridLine (very subtle)
+const TEAL: Color32 = Color32::from_rgb(0x48, 0xb7, 0xbd); // worktree
+const GREEN: Color32 = Color32::from_rgb(0x6e, 0xd2, 0x74); // activity dot
+const GRID_LINE: Color32 = Color32::from_rgb(0x1a, 0x15, 0x10); // gridLine (very subtle)
 /// Fill for empty tile slots: 92% STRIP_BG + 8% FG. Muted but visible so
 /// the grid reads as "dormant, click to wake" rather than "empty void".
 const EMPTY_SLOT_FILL: Color32 = Color32::from_rgb(0x1a, 0x18, 0x16);
@@ -299,7 +299,11 @@ impl UiLayer {
         card_rects.clear();
 
         // Detect workspace switch → trigger squish animation on the new card.
-        let current_ws_idx = state.workspaces.iter().position(|ws| ws.id == state.active_workspace).unwrap_or(0);
+        let current_ws_idx = state
+            .workspaces
+            .iter()
+            .position(|ws| ws.id == state.active_workspace)
+            .unwrap_or(0);
         if current_ws_idx != self.last_ws_idx {
             let t = ctx.input(|i| i.time);
             self.squish = Some((current_ws_idx, t));
@@ -398,8 +402,11 @@ fn build_strip(
                 logo_placeholder(ui);
                 ui.add_space(4.0);
                 // Vertical separator
-                let sep_rect = ui.allocate_exact_size(Vec2::new(1.0, 36.0), Sense::hover()).0;
-                ui.painter().rect_filled(sep_rect, Rounding::ZERO, GRID_LINE);
+                let sep_rect = ui
+                    .allocate_exact_size(Vec2::new(1.0, 36.0), Sense::hover())
+                    .0;
+                ui.painter()
+                    .rect_filled(sep_rect, Rounding::ZERO, GRID_LINE);
                 ui.add_space(8.0);
 
                 // Horizontal scroll wraps cards + the trailing `+` so the
@@ -937,12 +944,7 @@ fn search_placeholder(ui: &mut egui::Ui) {
     let width = 160.0;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
     let painter = ui.painter();
-    painter.rect(
-        rect,
-        Rounding::ZERO,
-        BG_DEEP,
-        Stroke::new(1.0, GRID_LINE),
-    );
+    painter.rect(rect, Rounding::ZERO, BG_DEEP, Stroke::new(1.0, GRID_LINE));
     // Left-aligned "⌕ search all tiles…" label
     painter.text(
         rect.left_center() + Vec2::new(8.0, 0.0),
@@ -958,7 +960,12 @@ fn search_placeholder(ui: &mut egui::Ui) {
         rect.right_center() + Vec2::new(-chip_w - 6.0, -chip_h / 2.0),
         Vec2::new(chip_w, chip_h),
     );
-    painter.rect(chip_rect, Rounding::ZERO, STRIP_BG, Stroke::new(1.0, GRID_LINE));
+    painter.rect(
+        chip_rect,
+        Rounding::ZERO,
+        STRIP_BG,
+        Stroke::new(1.0, GRID_LINE),
+    );
     painter.text(
         chip_rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -1014,9 +1021,11 @@ fn build_status_bar(ctx: &egui::Context, state: &AppState, now: Instant) {
 
                 // Tile count: "tile N/M"
                 if let Some(active_ws) = state.workspace(state.active_workspace) {
-                    let focused_idx = state.focused_tile
+                    let focused_idx = state
+                        .focused_tile
                         .and_then(|fid| active_ws.tiles.iter().position(|t| t.id == fid))
-                        .unwrap_or(0) + 1;
+                        .unwrap_or(0)
+                        + 1;
                     let total = active_ws.tiles.len();
                     ui.label(
                         RichText::new(format!("tile {focused_idx}/{total}"))
@@ -1029,13 +1038,18 @@ fn build_status_bar(ctx: &egui::Context, state: &AppState, now: Instant) {
 
                 // Generating count
                 if let Some(active_ws) = state.workspace(state.active_workspace) {
-                    let generating_count = active_ws.tiles.iter().filter(|t| {
-                        if let Some(at) = t.last_output_at {
-                            now.saturating_duration_since(at) < Duration::from_millis(GENERATING_LATENCY_MS)
-                        } else {
-                            false
-                        }
-                    }).count();
+                    let generating_count = active_ws
+                        .tiles
+                        .iter()
+                        .filter(|t| {
+                            if let Some(at) = t.last_output_at {
+                                now.saturating_duration_since(at)
+                                    < Duration::from_millis(GENERATING_LATENCY_MS)
+                            } else {
+                                false
+                            }
+                        })
+                        .count();
                     ui.label(
                         RichText::new(format!("{generating_count} generating"))
                             .color(FG_DIM)
@@ -1202,10 +1216,7 @@ fn paint_empty_slots(
             break;
         };
         let slot = egui::Rect::from_min_size(
-            egui::pos2(
-                r.x + EMPTY_SLOT_GAP * 0.5,
-                r.y + EMPTY_SLOT_GAP * 0.5,
-            ),
+            egui::pos2(r.x + EMPTY_SLOT_GAP * 0.5, r.y + EMPTY_SLOT_GAP * 0.5),
             egui::vec2(
                 (r.width - EMPTY_SLOT_GAP).max(1.0),
                 (r.height - EMPTY_SLOT_GAP).max(1.0),

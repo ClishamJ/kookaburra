@@ -19,7 +19,9 @@ use kookaburra_core::worktree::WorktreeConfig;
 
 use kookaburra_pty::{PtyEvent, PtyEventSink, PtyManager, SpawnRequest};
 use kookaburra_render::{cells_in_rect, RenderTile, Renderer, UiFrame};
-use kookaburra_ui::{EventResponse, PreparedFrame, TileDragGhost, UiLayer, STRIP_HEIGHT, STATUS_BAR_HEIGHT};
+use kookaburra_ui::{
+    EventResponse, PreparedFrame, TileDragGhost, UiLayer, STATUS_BAR_HEIGHT, STRIP_HEIGHT,
+};
 
 use portable_pty::PtySize;
 use winit::application::ApplicationHandler;
@@ -454,8 +456,12 @@ impl App {
                 } else {
                     None
                 };
-                let zen_generating = tile.last_output_at
-                    .map(|at| std::time::Instant::now().saturating_duration_since(at) < std::time::Duration::from_millis(600))
+                let zen_generating = tile
+                    .last_output_at
+                    .map(|at| {
+                        std::time::Instant::now().saturating_duration_since(at)
+                            < std::time::Duration::from_millis(600)
+                    })
                     .unwrap_or(false);
                 let is_primary = self.state.active_workspace().primary_tile == Some(tile.id);
                 self.render_scratch.push(RenderTile {
@@ -481,14 +487,24 @@ impl App {
                 .tiles
                 .iter()
                 .map(|t| {
-                    let generating = t.last_output_at
+                    let generating = t
+                        .last_output_at
                         .map(|at| now.saturating_duration_since(at) < gen_window)
                         .unwrap_or(false);
                     let is_primary = primary_tile == Some(t.id);
-                    (t.id, t.pty_id, t.title.clone(), generating, is_primary, t.follow_mode)
+                    (
+                        t.id,
+                        t.pty_id,
+                        t.title.clone(),
+                        generating,
+                        is_primary,
+                        t.follow_mode,
+                    )
                 })
                 .collect();
-            for (i, (tile_id, pty_id_opt, title, tile_generating, tile_primary, tile_follow)) in tiles.iter().enumerate() {
+            for (i, (tile_id, pty_id_opt, title, tile_generating, tile_primary, tile_follow)) in
+                tiles.iter().enumerate()
+            {
                 let Some(r) = rects.get(i).copied() else {
                     break;
                 };
@@ -626,10 +642,7 @@ impl App {
         // Dropped inside the strip area but not on a card → spin out.
         // Use egui's measured central rect so the hit zone matches the
         // actual strip (including its margin), not just the nominal height.
-        let top_area = ui
-            .central_rect()
-            .map(|c| c.top())
-            .unwrap_or(STRIP_HEIGHT);
+        let top_area = ui.central_rect().map(|c| c.top()).unwrap_or(STRIP_HEIGHT);
         if (0.0..=top_area).contains(&logical_y) {
             self.actions
                 .push(Action::MoveTileToNewWorkspace { tile_id });

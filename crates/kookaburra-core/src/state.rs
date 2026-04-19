@@ -382,7 +382,10 @@ mod tests {
         assert_eq!(t.title, "");
         assert!(t.worktree.is_none());
         assert!(!t.has_new_output);
-        assert!(t.follow_mode, "follow_mode defaults true so new terminals auto-scroll");
+        assert!(
+            t.follow_mode,
+            "follow_mode defaults true so new terminals auto-scroll"
+        );
     }
 
     #[test]
@@ -407,7 +410,11 @@ mod tests {
         let second = dummy_pty();
         let mut t = Tile::new(first);
         t.promote(second);
-        assert_eq!(t.pty_id, Some(first), "second promote should not clobber existing PTY");
+        assert_eq!(
+            t.pty_id,
+            Some(first),
+            "second promote should not clobber existing PTY"
+        );
     }
 
     #[test]

@@ -170,10 +170,7 @@ pub fn apply_action(state: &mut AppState, pty: &mut dyn PtySideEffects, action: 
         Action::SpawnInTile { tile_id, worktree } => {
             // Promote an empty slot to live. No-op if the tile doesn't
             // resolve or the slot is already live.
-            let is_empty_slot = state
-                .tile(tile_id)
-                .map(|t| !t.is_live())
-                .unwrap_or(false);
+            let is_empty_slot = state.tile(tile_id).map(|t| !t.is_live()).unwrap_or(false);
             if is_empty_slot {
                 let pty_id = pty.spawn(tile_id, worktree.as_ref());
                 if let Some(tile) = state.tile_mut(tile_id) {
@@ -233,10 +230,8 @@ pub fn apply_action(state: &mut AppState, pty: &mut dyn PtySideEffects, action: 
                 return;
             };
             // Take the source tile out, leave a fresh empty in its place.
-            let moved = std::mem::replace(
-                &mut state.workspaces[src_wi].tiles[src_ti],
-                Tile::empty(),
-            );
+            let moved =
+                std::mem::replace(&mut state.workspaces[src_wi].tiles[src_ti], Tile::empty());
             // Replace the destination's empty slot with the moved tile.
             // The moved Tile keeps its TileId so the PTY's event listener
             // (which tagged events with that id at spawn time) continues
@@ -250,10 +245,8 @@ pub fn apply_action(state: &mut AppState, pty: &mut dyn PtySideEffects, action: 
             if !state.workspaces[src_wi].tiles[src_ti].is_live() {
                 return;
             }
-            let moved = std::mem::replace(
-                &mut state.workspaces[src_wi].tiles[src_ti],
-                Tile::empty(),
-            );
+            let moved =
+                std::mem::replace(&mut state.workspaces[src_wi].tiles[src_ti], Tile::empty());
             let idx = state.workspaces.len() + 1;
             let mut ws = Workspace::new(format!("workspace {idx}"));
             let new_ws_id = ws.id;
@@ -595,7 +588,9 @@ mod tests {
         // Source still has the live tile; target unchanged.
         let src = state.workspace(source).unwrap();
         assert!(
-            src.tiles.iter().any(|t| t.id == source_tile_id && t.is_live()),
+            src.tiles
+                .iter()
+                .any(|t| t.id == source_tile_id && t.is_live()),
             "source tile stayed put — target had no empty slot"
         );
         assert_eq!(

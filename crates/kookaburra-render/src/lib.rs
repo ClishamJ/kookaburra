@@ -411,7 +411,11 @@ impl Renderer {
         let dim = if focused { 1.0 } else { UNFOCUSED_DIM };
         // Cursor blink: 530ms on, 530ms off (stepped, like koo-blink).
         let cursor_visible = ((t_secs / 0.53) as u64) % 2 == 0;
-        let cursor = if focused && cursor_visible { snap.cursor } else { None };
+        let cursor = if focused && cursor_visible {
+            snap.cursor
+        } else {
+            None
+        };
         let cw = metrics.width;
         let ch = metrics.height;
         let ascent = metrics.ascent;
@@ -433,9 +437,21 @@ impl Renderer {
         let border_color = if focused { accent } else { grid_line };
         let border_w = 2.0_f32;
         // Top
-        pipeline.push_bg(rect.x - border_w, rect.y - border_w, tile_w + border_w * 2.0, border_w, border_color);
+        pipeline.push_bg(
+            rect.x - border_w,
+            rect.y - border_w,
+            tile_w + border_w * 2.0,
+            border_w,
+            border_color,
+        );
         // Bottom
-        pipeline.push_bg(rect.x - border_w, rect.y + tile_h, tile_w + border_w * 2.0, border_w, border_color);
+        pipeline.push_bg(
+            rect.x - border_w,
+            rect.y + tile_h,
+            tile_w + border_w * 2.0,
+            border_w,
+            border_color,
+        );
         // Left
         pipeline.push_bg(rect.x - border_w, rect.y, border_w, tile_h, border_color);
         // Right
@@ -504,7 +520,13 @@ impl Renderer {
             let max_chars = ((tile_w - 42.0) / cw) as usize;
             for (i, ch_char) in snap.title.chars().take(max_chars).enumerate() {
                 if ch_char != ' ' {
-                    pipeline.push_fg(ch_char, title_start_x + i as f32 * cw, title_y, title_fg, queue);
+                    pipeline.push_fg(
+                        ch_char,
+                        title_start_x + i as f32 * cw,
+                        title_y,
+                        title_fg,
+                        queue,
+                    );
                 }
             }
         }
