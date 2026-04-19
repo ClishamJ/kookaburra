@@ -133,14 +133,23 @@ pub struct UiLayer {
 }
 
 impl UiLayer {
-    /// Build a fresh UI layer bound to `window`. The egui pixels-per-point
-    /// is seeded from the window's scale factor; this can be mutated later
-    /// via [`Self::set_scale_factor`].
+    /// Build a fresh UI layer bound to `window`. egui's pixels-per-point
+    /// is derived from `zoom_factor × native_pixels_per_point`. We seed
+    /// `native_pixels_per_point` from the window's scale factor via
+    /// `egui_winit::State::new` and leave `zoom_factor` at its default of
+    /// 1.0 — so the effective ppp matches the window scale.
+    ///
+    /// **Do not** call `ctx.set_pixels_per_point` here. At this point
+    /// `ctx.native_pixels_per_point()` is still `None`, so `set_pixels_per_point`
+    /// internally computes `zoom_factor = ppp / 1.0 = scale_factor`. Once
+    /// the first `take_egui_input` populates `native_pixels_per_point`, the
+    /// effective ppp becomes `scale_factor × scale_factor` (4.0 on Retina),
+    /// halving every logical coordinate and making `available_rect()` return
+    /// a rect half the expected size.
     #[must_use]
     pub fn new(window: &Window) -> Self {
         let ctx = egui::Context::default();
         let pixels_per_point = window.scale_factor() as f32;
-        ctx.set_pixels_per_point(pixels_per_point);
         let winit_state = egui_winit::State::new(
             ctx.clone(),
             egui::ViewportId::ROOT,
@@ -183,6 +192,11 @@ impl UiLayer {
         self.winit_state.on_window_event(window, event)
     }
 
+    /// `scale_factor` here is treated as the effective `pixels_per_point`.
+    /// `egui_winit` already tracks native scale via `ScaleFactorChanged`
+    /// events, so this should only be called to apply a user zoom on top
+    /// of the native scale. It sets ppp directly; egui internally derives
+    /// the zoom factor from `ppp / native_ppp`.
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
         self.ctx.set_pixels_per_point(scale_factor);
     }
@@ -279,6 +293,7 @@ impl UiLayer {
         }
         let squish = &self.squish;
 
+        let mut central = None;
         let full_output = ctx.run(raw_input, |ctx| {
             build_strip(
                 ctx,
@@ -292,10 +307,13 @@ impl UiLayer {
                 squish,
             );
             build_status_bar(ctx, state, now);
+            // `available_rect` only works inside `ctx.run`; capture the
+            // central area (what's left after the strip + status bar
+            // panels) so the app can size terminals into exactly this
+            // space.
+            central = Some(ctx.available_rect());
         });
-        // After the panels build themselves, `available_rect` is the
-        // central area that's left — what we should size terminals into.
-        self.central_rect = Some(ctx.available_rect());
+        self.central_rect = central;
         self.wants_keyboard = ctx.wants_keyboard_input();
         self.wants_pointer = ctx.wants_pointer_input();
         self.winit_state
