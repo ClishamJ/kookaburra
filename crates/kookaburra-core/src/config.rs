@@ -79,11 +79,42 @@ impl Theme {
             ],
         }
     }
+
+    /// Warm Kookaburra amber palette theme.
+    #[must_use]
+    pub fn kookaburra() -> Self {
+        Self {
+            name: "Kookaburra",
+            foreground: Rgba::rgb(0xf0, 0xed, 0xe8),
+            background: Rgba::rgb(0x2b, 0x24, 0x20),
+            cursor: Rgba::rgb(0xd4, 0xa0, 0x40),
+            selection_bg: Rgba::rgb(0xd4, 0xa0, 0x40), // translucent amber
+            ansi: [
+                Rgba::rgb(0x20, 0x1c, 0x18), // black (bgDeep)
+                Rgba::rgb(0xd0, 0x50, 0x40), // red
+                Rgba::rgb(0x78, 0xc8, 0x50), // green
+                Rgba::rgb(0xd8, 0xc0, 0x48), // yellow
+                Rgba::rgb(0x58, 0x88, 0xd8), // blue
+                Rgba::rgb(0xc8, 0x68, 0xb8), // magenta
+                Rgba::rgb(0x5c, 0xb8, 0xb8), // cyan (teal)
+                Rgba::rgb(0xf0, 0xed, 0xe8), // white
+                // bright variants
+                Rgba::rgb(0x36, 0x30, 0x2a), // bright black (bgDim)
+                Rgba::rgb(0xe8, 0x70, 0x58), // bright red
+                Rgba::rgb(0x8f, 0xd8, 0x68), // bright green
+                Rgba::rgb(0xf0, 0xd8, 0x60), // bright yellow
+                Rgba::rgb(0x78, 0xa8, 0xf0), // bright blue
+                Rgba::rgb(0xe0, 0x88, 0xd0), // bright magenta
+                Rgba::rgb(0x7c, 0xd8, 0xd8), // bright cyan
+                Rgba::rgb(0xf8, 0xf5, 0xf0), // bright white
+            ],
+        }
+    }
 }
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::tokyo_night()
+        Self::kookaburra()
     }
 }
 
@@ -160,9 +191,9 @@ mod tests {
     }
 
     #[test]
-    fn default_config_uses_tokyo_night_theme() {
+    fn default_config_uses_kookaburra_theme() {
         let c = Config::default();
-        assert_eq!(c.theme.name, "Tokyo Night");
+        assert_eq!(c.theme.name, "Kookaburra");
     }
 
     #[test]

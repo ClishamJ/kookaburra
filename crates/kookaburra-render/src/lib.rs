@@ -19,6 +19,7 @@ mod glyph_pipeline;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use egui_wgpu::{Renderer as EguiRenderer, ScreenDescriptor};
 use glyph_pipeline::{GlyphPipeline, LoadedFont};
@@ -54,7 +55,7 @@ pub const TILE_BORDER_PX: f32 = 1.0;
 /// Multiplier applied to rgb channels of unfocused tiles' fg colors — a
 /// cheap "the inactive tile is dim" effect without a second render pass.
 /// Tuned visually against Tokyo Night on dark backgrounds.
-pub const UNFOCUSED_DIM: f32 = 0.55;
+pub const UNFOCUSED_DIM: f32 = 0.82;
 
 /// One tile's worth of render input: where to draw, whether this tile
 /// should be rendered at full brightness, and optionally a fresh
@@ -64,6 +65,16 @@ pub struct RenderTile {
     pub tile_id: TileId,
     pub rect: Rect,
     pub focused: bool,
+    /// Whether this tile is actively receiving output (streaming).
+    pub generating: bool,
+    /// Whether this tile is the designated "primary" tile (first to wake,
+    /// default focus on workspace switch). Shown with a ◆ star indicator.
+    pub primary: bool,
+    /// Whether follow-mode is active for this tile. Shown as "▼ follow"
+    /// at the tile's bottom-right corner.
+    pub follow_mode: bool,
+    /// 1-based tile index within the workspace (shown in the header chip).
+    pub tile_index: usize,
     pub update: Option<TileSnapshot>,
 }
 
@@ -127,6 +138,10 @@ pub struct Renderer {
     /// still be drawn this frame (they don't change, but every frame
     /// re-emits every visible tile's instances).
     snapshots: HashMap<TileId, TileSnapshot>,
+
+    /// Monotonic start time, used for time-based animations (cursor blink,
+    /// marching ants, scanline shimmer).
+    start_time: Instant,
 
     // Keep window alive for the lifetime of the surface. Dropping this
     // after the surface drops is important on some platforms.
@@ -217,6 +232,7 @@ impl Renderer {
             pipeline,
             egui_renderer,
             snapshots: HashMap::new(),
+            start_time: Instant::now(),
             _window: window,
         }
     }
@@ -266,6 +282,22 @@ impl Renderer {
         // is just byte arithmetic per cell — <0.1ms even for a dense 6×2
         // grid at 4K.
         self.pipeline.clear_instances();
+
+        // Time since renderer creation, for animations.
+        let t_secs = self.start_time.elapsed().as_secs_f64();
+
+        // Grid background: fill the entire tile area with grid-line color
+        // so the gaps between tiles read as visible dividers. The tiles
+        // themselves will paint their own bg over this.
+        if let (Some(first), Some(last)) = (tiles.first(), tiles.last()) {
+            let grid_color = Rgba::rgb(0x48, 0x40, 0x3a); // GRID_LINE
+            let gx = first.rect.x - 4.0;
+            let gy = first.rect.y - 4.0;
+            let gw = (last.rect.x + last.rect.width - first.rect.x + 8.0).max(1.0);
+            let gh = (last.rect.y + last.rect.height - first.rect.y + 8.0).max(1.0);
+            self.pipeline.push_bg(gx, gy, gw, gh, grid_color);
+        }
+
         for t in tiles {
             if let Some(snap) = self.snapshots.get(&t.tile_id) {
                 Self::emit_tile(
@@ -276,7 +308,63 @@ impl Renderer {
                     snap,
                     t.rect,
                     t.focused,
+                    t.generating,
+                    t.primary,
+                    t.follow_mode,
+                    t.tile_index,
+                    t_secs,
                 );
+            }
+        }
+
+        // --- CRT scanline overlay ---
+        // Semi-transparent black lines every 3rd pixel row across the
+        // visible surface. A moving brightness wave simulates CRT refresh.
+        let surf_w = self.surface_config.width as f32;
+        let surf_h = self.surface_config.height as f32;
+        {
+            // CRT refresh wave: a bright band that scrolls downward at
+            // ~120px/sec (wraps around the screen height).
+            let wave_y = ((t_secs * 120.0) % surf_h as f64) as f32;
+            let wave_half = 60.0_f32; // half-width of the bright band
+            let mut y = 0.0_f32;
+            while y < surf_h {
+                // Distance from the wave center → modulate alpha.
+                let dist = (y - wave_y).abs().min(surf_h - (y - wave_y).abs());
+                let wave_factor = if dist < wave_half {
+                    1.0 - dist / wave_half
+                } else {
+                    0.0
+                };
+                // Base alpha ~7%, wave reduces it by up to 40% (brighter band).
+                let alpha = (18.0 - 7.0 * wave_factor).max(0.0) as u8;
+                let scanline_color = Rgba { r: 0, g: 0, b: 0, a: alpha };
+                self.pipeline.push_bg(0.0, y, surf_w, 1.0, scanline_color);
+                y += 3.0;
+            }
+        }
+
+        // --- Vignette ---
+        // Darken edges with a stepped radial approximation: four border
+        // strips with increasing opacity toward the edges.
+        {
+            let vignette_steps: &[(f32, u8)] = &[
+                (0.08, 8),   // outer 8% of each edge, alpha 8
+                (0.05, 16),  // outer 5%, alpha 16
+                (0.025, 28), // outer 2.5%, alpha 28
+            ];
+            for &(frac, alpha) in vignette_steps {
+                let v = Rgba { r: 0, g: 0, b: 0, a: alpha };
+                let dx = surf_w * frac;
+                let dy = surf_h * frac;
+                // Left
+                self.pipeline.push_bg(0.0, 0.0, dx, surf_h, v);
+                // Right
+                self.pipeline.push_bg(surf_w - dx, 0.0, dx, surf_h, v);
+                // Top
+                self.pipeline.push_bg(0.0, 0.0, surf_w, dy, v);
+                // Bottom
+                self.pipeline.push_bg(0.0, surf_h - dy, surf_w, dy, v);
             }
         }
 
@@ -353,6 +441,7 @@ impl Renderer {
     /// Walk every cell in `snap` and push the bg+fg instances needed to
     /// draw it at `rect`. Takes `&mut pipeline` + `&queue` as disjoint
     /// borrows so the caller can hold them both.
+    #[allow(clippy::too_many_arguments)]
     fn emit_tile(
         pipeline: &mut GlyphPipeline,
         queue: &wgpu::Queue,
@@ -361,12 +450,19 @@ impl Renderer {
         snap: &TileSnapshot,
         rect: Rect,
         focused: bool,
+        generating: bool,
+        primary: bool,
+        follow_mode: bool,
+        tile_index: usize,
+        t_secs: f64,
     ) {
         if snap.cols == 0 || snap.rows == 0 || snap.cells.is_empty() {
             return;
         }
         let dim = if focused { 1.0 } else { UNFOCUSED_DIM };
-        let cursor = if focused { snap.cursor } else { None };
+        // Cursor blink: 530ms on, 530ms off (stepped, like koo-blink).
+        let cursor_visible = ((t_secs / 0.53) as u64) % 2 == 0;
+        let cursor = if focused && cursor_visible { snap.cursor } else { None };
         let cw = metrics.width;
         let ch = metrics.height;
         let ascent = metrics.ascent;
@@ -374,13 +470,265 @@ impl Renderer {
         let cols = snap.cols as usize;
         let rows = snap.rows as usize;
 
+        let tile_w = cols as f32 * cw;
+        let tile_h = rows as f32 * ch;
+
+        // --- pixel drop shadow ---
+        // Hard 2px + 4px stepped shadow (from pixel.css .koo-tile).
+        {
+            let shadow1 = Rgba { r: 0, g: 0, b: 0, a: 230 }; // 90% opacity
+            let shadow2 = Rgba { r: 0, g: 0, b: 0, a: 115 }; // 45% opacity
+            pipeline.push_bg(rect.x + 2.0, rect.y + 2.0, tile_w, tile_h, shadow1);
+            pipeline.push_bg(rect.x + 4.0, rect.y + 4.0, tile_w, tile_h, shadow2);
+        }
+
+        // --- tile background fill ---
+        pipeline.push_bg(rect.x, rect.y, tile_w, tile_h, bg_default);
+
+        // --- tile border ---
+        // Focused = bright amber, primary-but-not-focused = muted amber
+        // (accentDeep), otherwise grid line.
+        let border_color = if focused {
+            Rgba::rgb(0xd4, 0xa0, 0x40) // ACCENT amber
+        } else if primary {
+            Rgba::rgb(0x8f, 0x60, 0x20) // ACCENT_DEEP
+        } else {
+            Rgba::rgb(0x48, 0x40, 0x3a) // GRID_LINE
+        };
+        let border_w = 2.0;
+        // Top
+        pipeline.push_bg(rect.x - border_w, rect.y - border_w, tile_w + border_w * 2.0, border_w, border_color);
+        // Bottom
+        pipeline.push_bg(rect.x - border_w, rect.y + tile_h, tile_w + border_w * 2.0, border_w, border_color);
+        // Left
+        pipeline.push_bg(rect.x - border_w, rect.y, border_w, tile_h, border_color);
+        // Right
+        pipeline.push_bg(rect.x + tile_w, rect.y, border_w, tile_h, border_color);
+
+        // --- tile header bar ---
+        let header_h = 22.0;
+        let header_bg = if focused {
+            Rgba::rgb(0x36, 0x30, 0x2a) // BG_DIM
+        } else {
+            Rgba::rgb(0x2b, 0x24, 0x20) // BG
+        };
+        pipeline.push_bg(rect.x, rect.y, cols as f32 * cw, header_h, header_bg);
+        // Header bottom separator
+        pipeline.push_bg(rect.x, rect.y + header_h, cols as f32 * cw, 1.0, border_color);
+
+        // --- focused tile inner shadow (inset 0 0 0 1px) ---
+        // The design applies `box-shadow: inset 0 0 0 1px bgColor` to the
+        // focused tile, creating a subtle inner frame. We approximate with
+        // 1px semi-transparent strips just inside the tile.
+        if focused {
+            let inner = Rgba { r: 0x2b, g: 0x24, b: 0x20, a: 100 }; // bg at ~40%
+            // top inner
+            pipeline.push_bg(rect.x + 1.0, rect.y + 1.0, tile_w - 2.0, 1.0, inner);
+            // bottom inner
+            pipeline.push_bg(rect.x + 1.0, rect.y + tile_h - 2.0, tile_w - 2.0, 1.0, inner);
+            // left inner
+            pipeline.push_bg(rect.x + 1.0, rect.y + 1.0, 1.0, tile_h - 2.0, inner);
+            // right inner
+            pipeline.push_bg(rect.x + tile_w - 2.0, rect.y + 1.0, 1.0, tile_h - 2.0, inner);
+        }
+
+        // --- focused tile: marching ants top accent ---
+        if focused {
+            // Animated marching ants: alternating 8px amber / 8px gap segments
+            // that scroll rightward at ~6.67px/sec (2.4s period = 16px).
+            let accent = Rgba::rgb(0xd4, 0xa0, 0x40);
+            let segment = 8.0_f32;
+            let period = 2.4; // seconds for one full segment cycle
+            let offset = ((t_secs % period) / period * (segment * 2.0) as f64) as f32;
+            let mut sx = rect.x - offset;
+            while sx < rect.x + tile_w {
+                let x0 = sx.max(rect.x);
+                let x1 = (sx + segment).min(rect.x + tile_w);
+                if x1 > x0 {
+                    pipeline.push_bg(x0, rect.y - border_w, x1 - x0, border_w, accent);
+                }
+                sx += segment * 2.0;
+            }
+
+            // Subtle glow: a 1px amber line with reduced alpha below the
+            // marching ants, extending across the full width.
+            let glow = Rgba { r: 0xd4, g: 0xa0, b: 0x40, a: 60 };
+            pipeline.push_bg(rect.x, rect.y - border_w - 1.0, tile_w, 1.0, glow);
+        }
+
+        // --- tile index chip ---
+        // Render the tile number (1-based) in the header bar as a colored chip.
+        if tile_index > 0 && tile_index <= 9 {
+            let chip_w = 16.0;
+            let chip_h = 14.0;
+            let chip_x = rect.x + 6.0;
+            let chip_y = rect.y + (header_h - chip_h) / 2.0;
+            let chip_bg = if focused {
+                Rgba::rgb(0xd4, 0xa0, 0x40) // ACCENT
+            } else {
+                Rgba::rgb(0x48, 0x40, 0x3a) // GRID_LINE
+            };
+            let chip_fg = if focused {
+                Rgba::rgb(0x20, 0x1c, 0x18) // BG_DEEP (dark on amber)
+            } else {
+                Rgba::rgb(0xa9, 0xa4, 0x9d) // FG_DIM
+            };
+            pipeline.push_bg(chip_x, chip_y, chip_w, chip_h, chip_bg);
+            // Render the digit character
+            let digit = char::from_digit(tile_index as u32, 10).unwrap_or('?');
+            let digit_x = chip_x + (chip_w - cw) / 2.0;
+            let digit_y = chip_y + ascent * 0.85;
+            pipeline.push_fg(digit, digit_x, digit_y, chip_fg, queue);
+        }
+
+        // --- running process indicator dot ---
+        // A 6×6 square between the index chip and the title. When
+        // generating, it pulses (koo-pulse: opacity + scale oscillation).
+        let dot_base_size = 6.0_f32;
+        let dot_x = rect.x + 26.0;
+        let dot_y = rect.y + (header_h - dot_base_size) / 2.0;
+        {
+            let (dot_color, dot_size) = if generating {
+                // koo-pulse: opacity 0.5–1.0, scale 0.7–1.0 at 1.2s period.
+                let phase = (t_secs * std::f64::consts::TAU / 1.2).sin() as f32;
+                let opacity = 0.5 + 0.5 * phase;
+                let scale = 0.7 + 0.3 * (phase + 1.0) / 2.0;
+                let alpha = (255.0 * opacity) as u8;
+                (Rgba { r: 0xd4, g: 0xa0, b: 0x40, a: alpha }, dot_base_size * scale)
+            } else if focused {
+                (Rgba::rgb(0x78, 0xc8, 0x50), dot_base_size) // GREEN
+            } else {
+                (Rgba::rgb(0xa9, 0xa4, 0x9d), dot_base_size) // FG_DIM
+            };
+            // Center the dot if it's scaled down.
+            let offset = (dot_base_size - dot_size) / 2.0;
+            pipeline.push_bg(dot_x + offset, dot_y + offset, dot_size, dot_size, dot_color);
+        }
+
+        // --- tile title text ---
+        // Render the tile title (from OSC) in the header bar.
+        let title_start_x = rect.x + 36.0; // after index chip + dot
+        if !snap.title.is_empty() {
+            let title_fg = if focused {
+                theme.foreground
+            } else {
+                dim_rgba(theme.foreground, dim)
+            };
+            let title_y = rect.y + (header_h - ch) / 2.0 + ascent;
+            let max_chars = ((tile_w - 42.0) / cw) as usize;
+            for (i, ch_char) in snap.title.chars().take(max_chars).enumerate() {
+                if ch_char != ' ' {
+                    pipeline.push_fg(ch_char, title_start_x + i as f32 * cw, title_y, title_fg, queue);
+                }
+            }
+        }
+
+        // --- primary star indicator (◆) ---
+        // The design shows a ◆ in the tile header right side when this tile
+        // is the designated primary tile. 11px amber glyph, right-aligned
+        // in the header.
+        if primary {
+            let star_color = Rgba::rgb(0xd4, 0xa0, 0x40); // ACCENT
+            let star_x = rect.x + tile_w - 18.0;
+            let star_y = rect.y + (header_h - ch) / 2.0 + ascent;
+            pipeline.push_fg('◆', star_x, star_y, star_color, queue);
+        }
+
+        // --- follow-mode indicator ("▼ follow") ---
+        // Rendered at the tile's bottom-right corner in teal, matching the
+        // design's follow-mode hint.
+        if follow_mode {
+            let follow_color = Rgba::rgb(0x5c, 0xb8, 0xb8); // TEAL
+            let text = "▼ follow";
+            let follow_x = rect.x + tile_w - (text.len() as f32) * cw - 8.0;
+            let follow_y = rect.y + tile_h - 6.0;
+            for (i, c) in text.chars().enumerate() {
+                if c != ' ' {
+                    pipeline.push_fg(c, follow_x + i as f32 * cw, follow_y, follow_color, queue);
+                }
+            }
+        }
+
+        // --- generating: output drip effect ---
+        // When a tile is actively streaming, draw a short animated "drip"
+        // below the header separator — an amber bar that grows downward
+        // then fades, inspired by the design's OutputDrip component.
+        if generating {
+            let drip_period = 1.4; // seconds per drip cycle
+            let drip_phase = (t_secs % drip_period) / drip_period;
+            let drip_h = if drip_phase < 0.7 {
+                // Growing phase: 0 → 48px
+                (drip_phase / 0.7) as f32 * 48.0
+            } else {
+                48.0
+            };
+            let drip_alpha = if drip_phase < 0.7 {
+                255
+            } else {
+                // Fade out: 255 → 0
+                (255.0 * (1.0 - (drip_phase - 0.7) / 0.3) as f32) as u8
+            };
+            if drip_alpha > 0 && drip_h > 0.0 {
+                let drip_color = Rgba { r: 0xd4, g: 0xa0, b: 0x40, a: drip_alpha / 3 };
+                // Drip bar at left edge of tile, just below header separator
+                pipeline.push_bg(rect.x, rect.y + header_h + 1.0, 3.0, drip_h, drip_color);
+                // Mirror on right edge
+                pipeline.push_bg(rect.x + tile_w - 3.0, rect.y + header_h + 1.0, 3.0, drip_h, drip_color);
+            }
+
+            // Pulsing header glow: subtle amber overlay on the header bar
+            // that breathes with a sine wave.
+            let glow_alpha = (20.0 + 15.0 * (t_secs * std::f64::consts::TAU / 1.2).sin() as f32) as u8;
+            let glow = Rgba { r: 0xd4, g: 0xa0, b: 0x40, a: glow_alpha };
+            pipeline.push_bg(rect.x, rect.y, tile_w, header_h, glow);
+        }
+
+        // Offset cell grid below the header bar + separator.
+        let content_y = rect.y + header_h + 1.0;
+
+        // --- dithered background pattern ---
+        // Subtle horizontal lines every 4px across the tile content area,
+        // mirroring pixel.css's `repeating-linear-gradient` dither.
+        {
+            let dither = Rgba { r: 255, g: 255, b: 255, a: 4 }; // ~1.5% white
+            let content_h = tile_h - header_h - 1.0;
+            let mut dy = 0.0_f32;
+            while dy < content_h {
+                pipeline.push_bg(rect.x, content_y + dy, tile_w, 2.0, dither);
+                dy += 4.0;
+            }
+        }
+
+        // --- koo-glitch: occasional horizontal offset on a few rows ---
+        // Triggers for ~200ms every ~10 seconds. During the glitch window,
+        // rows whose index matches a pseudo-random pattern get a 1-2px
+        // horizontal shift. Very subtle, very retro.
+        let glitch_period = 10.0;
+        let glitch_phase = t_secs % glitch_period;
+        let glitching = glitch_phase < 0.2; // active for 200ms
+        let glitch_seed = (t_secs * 5.0) as u32;
+
         for row in 0..rows {
             let row_start = row * cols;
-            let cy = rect.y + row as f32 * ch;
+            let cy = content_y + row as f32 * ch;
             let by = cy + ascent;
+            // Glitch offset for this row (if active).
+            let row_glitch_x = if glitching {
+                // Pseudo-random: XOR row with seed, check low bits.
+                let h = (row as u32) ^ glitch_seed;
+                if h % 5 == 0 {
+                    // Shift this row by -2, -1, +1, or +2 px.
+                    let shift = ((h >> 2) % 5) as f32 - 2.0;
+                    shift
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
             for col in 0..cols {
                 let cell = &snap.cells[row_start + col];
-                let cx = rect.x + col as f32 * cw;
+                let cx = rect.x + col as f32 * cw + row_glitch_x;
 
                 let is_cursor = matches!(
                     cursor,

@@ -21,6 +21,7 @@ use winit::window::Window;
 
 use kookaburra_core::action::Action;
 use kookaburra_core::ids::WorkspaceId;
+use kookaburra_core::layout::Rect as CoreRect;
 use kookaburra_core::state::{AppState, Workspace};
 
 /// Bytes arriving on a tile within this window treat it as "actively
@@ -34,21 +35,29 @@ const GENERATING_LATENCY_MS: u64 = 600;
 /// matter for a mostly-idle UI.
 const ANIMATION_TICK: Duration = Duration::from_millis(50);
 
+/// Window chrome bar height — brand + hotkey hints.
+pub const CHROME_BAR_HEIGHT: f32 = 28.0;
 /// Strip dimensions per spec §3 ("Card dimensions: ~140×48px").
 pub const STRIP_HEIGHT: f32 = 56.0;
 pub const CARD_WIDTH: f32 = 140.0;
 pub const CARD_HEIGHT: f32 = 44.0;
+/// Status bar height at bottom of window.
+pub const STATUS_BAR_HEIGHT: f32 = 22.0;
 
-/// Tokyo Night-ish chrome palette (matches the default theme).
-const STRIP_BG: Color32 = Color32::from_rgb(26, 27, 38);
-const CARD_BG: Color32 = Color32::from_rgb(40, 42, 54);
-const CARD_BG_ACTIVE: Color32 = Color32::from_rgb(60, 62, 80);
-const CARD_FG_ACTIVE: Color32 = Color32::from_rgb(224, 229, 255);
-const CARD_FG_INACTIVE: Color32 = Color32::from_rgb(150, 153, 168);
-const ACCENT: Color32 = Color32::from_rgb(122, 162, 247);
-/// Pulse dot for the "has unread output" hint on inactive cards.
-const ACTIVITY_DOT: Color32 = Color32::from_rgb(158, 206, 106);
-const ACTIVITY_DOT_RADIUS: f32 = 3.5;
+/// Kookaburra warm amber palette
+const STRIP_BG: Color32 = Color32::from_rgb(0x2b, 0x24, 0x20);      // bg
+const BG_DEEP: Color32 = Color32::from_rgb(0x20, 0x1c, 0x18);       // bgDeep
+const BG_DIM: Color32 = Color32::from_rgb(0x36, 0x30, 0x2a);        // bgDim
+const FG: Color32 = Color32::from_rgb(0xf0, 0xed, 0xe8);            // fg
+const FG_DIM: Color32 = Color32::from_rgb(0xa9, 0xa4, 0x9d);        // fgDim
+const FG_FAINT: Color32 = Color32::from_rgb(0x76, 0x72, 0x6c);      // fgFaint
+const ACCENT: Color32 = Color32::from_rgb(0xd4, 0xa0, 0x40);        // kookaburra amber
+#[allow(dead_code)]
+const ACCENT_DEEP: Color32 = Color32::from_rgb(0x8f, 0x60, 0x20);   // darker beak
+#[allow(dead_code)]
+const TEAL: Color32 = Color32::from_rgb(0x5c, 0xb8, 0xb8);          // worktree
+const GREEN: Color32 = Color32::from_rgb(0x78, 0xc8, 0x50);         // activity dot
+const GRID_LINE: Color32 = Color32::from_rgb(0x48, 0x40, 0x3a);     // gridLine
 
 /// Routing decision for an input event.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -96,6 +105,47 @@ pub struct TileDragGhost {
     pub label: String,
 }
 
+/// Tips the Kooka mascot might share.
+const KOOKA_TIPS: &[&str] = &[
+    "\u{2318}\u{21e7}T for a new workspace",
+    "drag a tile onto a card",
+    "\u{2318}Enter = zen mode",
+    "press Z to zen real quick",
+    "double-click a card to rename",
+    "HDAHAHA!",
+    "\u{2026}",
+    "watching claude work",
+];
+
+/// Kooka mascot moods.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum KookaMood {
+    Idle,
+    Watching,
+    Cheering,
+    Laugh,
+}
+
+/// Persistent state for the Kooka mascot bird.
+struct KookaState {
+    /// Position on screen (logical pixels, top-left of sprite).
+    x: f32,
+    y: f32,
+    /// -1 facing left, +1 facing right.
+    dir: f32,
+    mood: KookaMood,
+    /// Speech bubble text (None = silent).
+    phrase: Option<String>,
+    /// When the phrase appeared (egui time), so we can fade it.
+    phrase_started: f64,
+    /// When the last hop happened.
+    last_hop: f64,
+    /// When the last tip was shown.
+    last_tip: f64,
+    /// Hop counter for comedy beats.
+    hop_count: u32,
+}
+
 /// UI layer state. Holds the egui `Context` and the `egui_winit::State`
 /// adapter that converts `WindowEvent`s into egui input.
 pub struct UiLayer {
@@ -112,6 +162,15 @@ pub struct UiLayer {
     /// Ghost pill to paint following the cursor while a tile drag is
     /// active. Set by the app; cleared on drop.
     tile_drag_ghost: Option<TileDragGhost>,
+    /// The Kooka mascot bird.
+    kooka: KookaState,
+    /// Tile rects for Kooka hopping (logical pixels, from the app layer).
+    kooka_tile_rects: Vec<CoreRect>,
+    /// Which workspace index is being "squish"-animated (koo-ws-squish)
+    /// and when it started. Cleared after the animation (~340ms) elapses.
+    squish: Option<(usize, f64)>,
+    /// Last active workspace index, for detecting switches.
+    last_ws_idx: usize,
 }
 
 impl UiLayer {
@@ -140,6 +199,20 @@ impl UiLayer {
             reorder: None,
             card_rects: Vec::new(),
             tile_drag_ghost: None,
+            kooka: KookaState {
+                x: 200.0,
+                y: 120.0,
+                dir: 1.0,
+                mood: KookaMood::Idle,
+                phrase: None,
+                phrase_started: 0.0,
+                last_hop: 0.0,
+                last_tip: 0.0,
+                hop_count: 0,
+            },
+            kooka_tile_rects: Vec::new(),
+            squish: None,
+            last_ws_idx: 0,
         }
     }
 
@@ -147,6 +220,16 @@ impl UiLayer {
     /// on drop / cancel to clear the ghost.
     pub fn set_tile_drag_ghost(&mut self, ghost: Option<TileDragGhost>) {
         self.tile_drag_ghost = ghost;
+    }
+
+    /// Update the Kooka's tile rects (logical pixels) so it can hop to
+    /// tile headers. Called by the app layer each frame with the computed
+    /// tile layout rects.
+    pub fn set_tile_rects_for_kooka(&mut self, rects: &[CoreRect]) {
+        self.kooka_tile_rects.clear();
+        for r in rects {
+            self.kooka_tile_rects.push(*r);
+        }
     }
 
     /// Forward a winit event to egui. Returns egui's response so the
@@ -234,7 +317,27 @@ impl UiLayer {
         let tile_drag_ghost = self.tile_drag_ghost.as_ref();
         let now = Instant::now();
         card_rects.clear();
+        let kooka = &mut self.kooka;
+        let kooka_rects = &self.kooka_tile_rects;
+
+        // Detect workspace switch → trigger squish animation on the new card.
+        let current_ws_idx = state.workspaces.iter().position(|ws| ws.id == state.active_workspace).unwrap_or(0);
+        if current_ws_idx != self.last_ws_idx {
+            let t = ctx.input(|i| i.time);
+            self.squish = Some((current_ws_idx, t));
+            self.last_ws_idx = current_ws_idx;
+        }
+        // Expire squish after 340ms.
+        if let Some((_, started)) = self.squish {
+            let t = ctx.input(|i| i.time);
+            if t - started > 0.34 {
+                self.squish = None;
+            }
+        }
+        let squish = &self.squish;
+
         let full_output = ctx.run(raw_input, |ctx| {
+            build_chrome_bar(ctx);
             build_strip(
                 ctx,
                 state,
@@ -244,7 +347,14 @@ impl UiLayer {
                 card_rects,
                 tile_drag_ghost,
                 now,
+                squish,
             );
+            build_status_bar(ctx, state, now);
+            // Kooka mascot — tick + paint (only outside zen mode).
+            if !state.zen_mode {
+                tick_kooka(kooka, kooka_rects, state, ctx);
+                paint_kooka(ctx, kooka);
+            }
         });
         self.wants_keyboard = ctx.wants_keyboard_input();
         self.wants_pointer = ctx.wants_pointer_input();
@@ -260,6 +370,94 @@ impl UiLayer {
     }
 }
 
+/// Build the window chrome bar — brand wordmark + global hotkey hints.
+/// Sits above the strip in the same position as the design's traffic-light bar.
+fn build_chrome_bar(ctx: &egui::Context) {
+    egui::TopBottomPanel::top("kookaburra-chrome-bar")
+        .exact_height(CHROME_BAR_HEIGHT)
+        .frame(
+            Frame::none()
+                .fill(BG_DEEP)
+                .stroke(Stroke::new(1.0, GRID_LINE))
+                .inner_margin(egui::Margin::symmetric(12.0, 0.0)),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+
+                // Pixel-style "K" logo with koo-peck bob.
+                {
+                    let t = ui.ctx().input(|i| i.time);
+                    let peck_cycle = (t % 1.6) / 1.6;
+                    let peck_dy = if peck_cycle > 0.84 && peck_cycle < 0.87 {
+                        1.5
+                    } else if peck_cycle > 0.87 && peck_cycle < 0.91 {
+                        -0.5
+                    } else {
+                        0.0
+                    };
+                    let (logo_rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 18.0), Sense::hover());
+                    ui.painter().text(
+                        logo_rect.center() + Vec2::new(0.0, peck_dy as f32),
+                        egui::Align2::CENTER_CENTER,
+                        "K",
+                        FontId::monospace(16.0),
+                        ACCENT,
+                    );
+                }
+
+                // Brand wordmark — uppercase, letter-spaced, dimmer than
+                // normal text to stay decorative rather than functional.
+                ui.label(
+                    RichText::new("K O O K A B U R R A")
+                        .color(FG_DIM)
+                        .font(FontId::monospace(9.0)),
+                );
+
+                // Push right
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    // Hotkey hints
+                    chrome_chip(ui, "Z zen");
+                    chrome_chip(ui, "\u{2318}T tile");
+                    chrome_chip(ui, "\u{2318}N ws");
+                });
+            });
+        });
+}
+
+/// Paint subtle horizontal dither lines over a region (pixel.css effect).
+/// Every 3rd pixel gets a faint white line, creating a CRT-like dither.
+fn paint_dither_lines(painter: &egui::Painter, rect: egui::Rect) {
+    let dither = Color32::from_rgba_premultiplied(255, 255, 255, 5); // ~2% white
+    let mut y = rect.top();
+    while y < rect.bottom() {
+        painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(rect.left(), y), Vec2::new(rect.width(), 1.0)),
+            Rounding::ZERO,
+            dither,
+        );
+        y += 3.0;
+    }
+}
+
+/// Small hotkey hint chip for the chrome bar.
+fn chrome_chip(ui: &mut egui::Ui, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(text.len() as f32 * 5.5 + 10.0, 16.0),
+        Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, Rounding::ZERO, BG_DIM);
+    ui.painter().rect_stroke(rect, Rounding::ZERO, Stroke::new(1.0, GRID_LINE));
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        FontId::monospace(8.0),
+        FG_FAINT,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_strip(
     ctx: &egui::Context,
@@ -270,25 +468,30 @@ fn build_strip(
     card_rects: &mut Vec<(WorkspaceId, egui::Rect)>,
     tile_drag_ghost: Option<&TileDragGhost>,
     now: Instant,
+    squish: &Option<(usize, f64)>,
 ) {
     // Anything animating (pulse + generating dots) wants a steady repaint.
     // We set a single flag here so we only pay for one `request_repaint_after`
     // per frame regardless of how many cards are active.
     let mut any_animation = tile_drag_ghost.is_some();
 
-    egui::TopBottomPanel::top("kookaburra-strip")
+    let strip_resp = egui::TopBottomPanel::top("kookaburra-strip")
         .exact_height(STRIP_HEIGHT)
         .frame(
             Frame::none()
                 .fill(STRIP_BG)
+                .stroke(Stroke::new(1.0, GRID_LINE))
                 .inner_margin(egui::Margin::symmetric(10.0, 6.0)),
         )
         .show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
-                // Logo — placeholder monogram until the SVG is rasterized
-                // into an egui texture. 1-bit white "K".
+                // Logo + brand
                 logo_placeholder(ui);
-                ui.add_space(12.0);
+                ui.add_space(4.0);
+                // Vertical separator
+                let sep_rect = ui.allocate_exact_size(Vec2::new(1.0, 36.0), Sense::hover()).0;
+                ui.painter().rect_filled(sep_rect, Rounding::ZERO, GRID_LINE);
+                ui.add_space(8.0);
 
                 // Horizontal scroll wraps cards + the trailing `+` so the
                 // strip stays navigable when there are more workspaces
@@ -299,7 +502,7 @@ fn build_strip(
                         ui.horizontal_centered(|ui| {
                             for (idx, ws) in state.workspaces.iter().enumerate() {
                                 let (rect, animating) = draw_workspace_slot(
-                                    ui, ws, idx, state, actions, renaming, reorder, now,
+                                    ui, ws, idx, state, actions, renaming, reorder, now, squish,
                                 );
                                 card_rects.push((ws.id, rect));
                                 any_animation |= animating;
@@ -311,8 +514,16 @@ fn build_strip(
                             }
                         });
                     });
+
+                // Search box placeholder — from the design's strip search input.
+                // Read-only decorative widget; actual search is Phase 7.
+                ui.add_space(6.0);
+                search_placeholder(ui);
             });
         });
+
+    // Dither overlay on the strip (pixel.css .koo-strip dither).
+    paint_dither_lines(&ctx.layer_painter(egui::LayerId::background()), strip_resp.response.rect);
 
     // Workspace vanished (e.g. deleted via middle-click while mid-rename)?
     // Drop the stale editor.
@@ -329,6 +540,13 @@ fn build_strip(
     // both the strip and the tile area beneath.
     if let Some(ghost) = tile_drag_ghost {
         paint_tile_drag_ghost(ctx, ghost);
+    }
+
+    // Decorative walker bird — a tiny "K" that hops slowly across the
+    // grid area, like the design's WalkerBird. Low opacity so it stays
+    // whimsical rather than distracting.
+    if !state.zen_mode {
+        paint_walker_bird(ctx, now);
     }
 
     if any_animation {
@@ -350,6 +568,7 @@ fn draw_workspace_slot(
     renaming: &mut Option<RenameState>,
     reorder: &mut Option<ReorderState>,
     now: Instant,
+    squish: &Option<(usize, f64)>,
 ) -> (egui::Rect, bool) {
     let active = ws.id == state.active_workspace;
 
@@ -361,15 +580,19 @@ fn draw_workspace_slot(
     let signals = workspace_signals(ws, now);
     let show_activity_dot = !active && signals.dirty && !signals.generating;
     let dragging_this = reorder.as_ref().is_some_and(|r| r.source_idx == idx);
+    let is_squishing = squish.map(|(si, _)| si == idx).unwrap_or(false);
     let resp = draw_card(
         ui,
         &ws.label,
         ws.id,
+        idx,
         active,
         ws.tiles.len(),
+        &ws.layout.label(),
         show_activity_dot,
         signals.generating,
         dragging_this,
+        is_squishing,
         ui.ctx().input(|i| i.time),
     );
     // Drag start: plain left-drag on a card. Use this to reorder, not
@@ -397,7 +620,7 @@ fn draw_workspace_slot(
             focus_requested: false,
         });
     }
-    let animating = show_activity_dot || signals.generating;
+    let animating = show_activity_dot || signals.generating || is_squishing;
     (resp.rect, animating)
 }
 
@@ -413,13 +636,13 @@ fn draw_rename_editor(
         .expect("draw_rename_editor only called when renaming is Some");
     let edit = egui::TextEdit::singleline(&mut r.buffer)
         .desired_width(CARD_WIDTH - 12.0)
-        .text_color(CARD_FG_ACTIVE)
+        .text_color(FG)
         .font(FontId::proportional(13.0))
         .frame(false);
     let frame = Frame::none()
-        .fill(CARD_BG_ACTIVE)
+        .fill(BG_DIM)
         .stroke(Stroke::new(1.5, ACCENT))
-        .rounding(Rounding::same(6.0))
+        .rounding(Rounding::ZERO)
         .inner_margin(egui::Margin::symmetric(6.0, 8.0));
     let response = frame
         .show(ui, |ui| {
@@ -456,14 +679,37 @@ fn draw_rename_editor(
 }
 
 fn logo_placeholder(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
     let painter = ui.painter();
+    let t = ui.ctx().input(|i| i.time);
+
+    // koo-idle-bob: gentle 1px sine bob (2s period).
+    let bob = -1.0 * ((t * std::f64::consts::TAU / 2.0).sin() as f32);
+
+    // koo-peck: a subtle forward-tilt every 1.6s. The design uses
+    // `transformOrigin: 40% 70%` with a rotation, which we approximate as
+    // a small vertical dip + horizontal nudge during the "peck" phase.
+    let peck_cycle = (t % 1.6) / 1.6;
+    let (peck_dx, peck_dy) = if peck_cycle < 0.15 {
+        // Down-peck: dip 2px forward-down.
+        let p = (peck_cycle / 0.15) as f32;
+        (p * 1.5, p * 2.0)
+    } else if peck_cycle < 0.30 {
+        // Return: back to rest.
+        let p = ((peck_cycle - 0.15) / 0.15) as f32;
+        ((1.0 - p) * 1.5, (1.0 - p) * 2.0)
+    } else {
+        (0.0, 0.0)
+    };
+
+    let center = rect.center() + Vec2::new(peck_dx, bob + peck_dy);
+    // Draw a pixel-art K: big monospace glyph
     painter.text(
-        rect.center(),
+        center,
         egui::Align2::CENTER_CENTER,
         "K",
-        FontId::monospace(20.0),
-        Color32::WHITE,
+        FontId::monospace(24.0),
+        ACCENT,
     );
 }
 
@@ -471,50 +717,148 @@ fn logo_placeholder(ui: &mut egui::Ui) {
 fn draw_card(
     ui: &mut egui::Ui,
     label: &str,
-    id: WorkspaceId,
+    _id: WorkspaceId,
+    ws_index: usize,
     active: bool,
     tile_count: usize,
+    layout_label: &str,
     activity: bool,
     generating: bool,
     dragging: bool,
+    squishing: bool,
     time_secs: f64,
 ) -> egui::Response {
-    let size = Vec2::new(CARD_WIDTH, CARD_HEIGHT);
-    let (bg, mut fg) = if active {
-        (CARD_BG_ACTIVE, CARD_FG_ACTIVE)
+    // koo-ws-squish: a quick scale-bounce when switching to this card.
+    // v2 keyframes:
+    //   0%   scaleX(0.6) scaleY(1.15)  — compressed horizontally, tall
+    //   60%  scaleX(1.08) scaleY(0.94) — overshot wide, short
+    //   100% scaleX(1) scaleY(1)       — settle
+    // 340ms total, cubic-bezier(.2,.9,.3,1.3).
+    let (squish_sx, squish_sy) = if squishing {
+        // Use a simple linear interpolation through the keyframes.
+        // The egui time-based animation won't perfectly match CSS beziers
+        // but captures the feel.
+        let t_frac = ((time_secs * 1000.0) % 340.0) / 340.0;
+        if t_frac < 0.6 {
+            let p = (t_frac / 0.6) as f32;
+            // 0→60%: scaleX 0.6→1.08, scaleY 1.15→0.94
+            let sx = 0.6 + p * 0.48;
+            let sy = 1.15 - p * 0.21;
+            (sx, sy)
+        } else {
+            let p = ((t_frac - 0.6) / 0.4) as f32;
+            // 60→100%: scaleX 1.08→1.0, scaleY 0.94→1.0
+            let sx = 1.08 - p * 0.08;
+            let sy = 0.94 + p * 0.06;
+            (sx, sy)
+        }
     } else {
-        (CARD_BG, CARD_FG_INACTIVE)
+        (1.0, 1.0)
+    };
+    // Active cards lift -2px (translateY), inactive scale to 0.96.
+    let inactive_scale = if active { 1.0 } else { 0.96 };
+    let card_h = CARD_HEIGHT * squish_sy * inactive_scale;
+    let card_w = CARD_WIDTH * squish_sx;
+    let size = Vec2::new(card_w, card_h);
+    let (bg, mut fg) = if active {
+        (BG_DIM, FG)
+    } else {
+        (BG_DEEP, FG_DIM)
     };
     // Fade the card being dragged so the drop indicator reads clearer.
     if dragging {
         fg = fg.gamma_multiply(0.55);
     }
+    // Build label with optional generating pulse dot prefix.
     let text = if label.is_empty() {
-        format!("Workspace {}", id.raw())
+        format!("Workspace {}", ws_index + 1)
     } else {
         label.to_string()
     };
-    let button = Button::new(
-        RichText::new(text)
-            .color(fg)
-            .font(FontId::proportional(13.0)),
-    )
-    .fill(if dragging { bg.gamma_multiply(0.7) } else { bg })
-    .stroke(if active {
-        Stroke::new(1.5, ACCENT)
+    // Generating pulse: "● label" where the dot breathes.
+    let label_rich = if generating {
+        let pulse = 0.5 + 0.5 * ((time_secs * std::f64::consts::TAU / 1.2).sin() as f32);
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            "● ",
+            0.0,
+            egui::TextFormat {
+                font_id: FontId::proportional(13.0),
+                color: ACCENT.gamma_multiply(pulse),
+                ..Default::default()
+            },
+        );
+        job.append(
+            &text,
+            0.0,
+            egui::TextFormat {
+                font_id: FontId::proportional(13.0),
+                color: fg,
+                ..Default::default()
+            },
+        );
+        job
     } else {
-        Stroke::NONE
-    })
-    .rounding(Rounding::same(6.0))
-    // `click_and_drag` so egui reports drag-started / dragged / drag-stopped
-    // on the card for the reorder flow. Plain clicks still fire on release
-    // when the drag threshold wasn't crossed.
-    .sense(Sense::click_and_drag())
-    .min_size(size);
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            &text,
+            0.0,
+            egui::TextFormat {
+                font_id: FontId::proportional(13.0),
+                color: fg,
+                ..Default::default()
+            },
+        );
+        job
+    };
+    let button = Button::new(label_rich)
+        .fill(if dragging { bg.gamma_multiply(0.7) } else { bg })
+        .stroke(if active {
+            Stroke::new(2.0, ACCENT)
+        } else {
+            Stroke::new(2.0, GRID_LINE)
+        })
+        .rounding(Rounding::ZERO)
+        .sense(Sense::click_and_drag())
+        .min_size(size);
     let response = ui.add_sized(size, button);
-    // Sub-label: tile count.
+
+    let painter = ui.painter();
+
+    // Active card bottom accent bar — a bright amber strip at the bottom
+    // edge that reads as "this is the current workspace" at a glance.
+    if active {
+        let bar = egui::Rect::from_min_size(
+            response.rect.left_bottom() - Vec2::new(0.0, 3.0),
+            Vec2::new(CARD_WIDTH, 3.0),
+        );
+        painter.rect_filled(bar, Rounding::ZERO, ACCENT);
+    }
+
+    // Hotkey chip in top-right corner: ⌘N
+    {
+        let chip_text = format!("\u{2318}{}", ws_index + 1);
+        let chip_rect = egui::Rect::from_min_size(
+            response.rect.right_top() + Vec2::new(-24.0, -2.0),
+            Vec2::new(22.0, 12.0),
+        );
+        let (chip_bg, chip_fg_color) = if active {
+            (ACCENT, BG_DEEP)
+        } else {
+            (STRIP_BG, FG_FAINT)
+        };
+        painter.rect_filled(chip_rect, Rounding::ZERO, chip_bg);
+        painter.text(
+            chip_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            chip_text,
+            FontId::monospace(8.0),
+            chip_fg_color,
+        );
+    }
+
+    // Sub-label: tile count bottom-right
     if tile_count > 0 {
-        let painter = ui.painter();
         let pos = response.rect.right_bottom() - Vec2::new(8.0, 6.0);
         painter.text(
             pos,
@@ -524,22 +868,83 @@ fn draw_card(
             fg.gamma_multiply(0.75),
         );
     }
-    // Activity / generating markers live in the top-right corner. Generating
-    // wins over the static "unread" dot: if bytes are actively streaming we
-    // surface that, and the unread state becomes redundant anyway.
+    // Tile indicator dots below the label — each dot is a small square,
+    // and when the card is generating the dots cascade with a staggered
+    // breathe animation (mimicking koo-pulse from the design).
+    if tile_count > 0 {
+        let painter = ui.painter();
+        let dot_size = 6.0;
+        let spacing = 3.0;
+        let total_width = tile_count as f32 * (dot_size + spacing) - spacing;
+        let start_x = response.rect.center().x - total_width / 2.0;
+        let start_y = response.rect.bottom() - 10.0;
+        for i in 0..tile_count {
+            let x = start_x + i as f32 * (dot_size + spacing);
+            // koo-bounce: generating dots get a staggered vertical bounce
+            // (1.1s period, 180ms delay per dot modulo 1s).
+            let bounce_y = if generating {
+                let delay = (i as f64 * 0.18) % 1.0;
+                let phase = ((time_secs - delay) * std::f64::consts::TAU / 1.1).sin();
+                // Bounce only upward (negative y): clamp the sine to [0, 1].
+                let up = (phase as f32).max(0.0);
+                -3.0 * up
+            } else {
+                0.0
+            };
+            let dot_rect = egui::Rect::from_min_size(
+                egui::Pos2::new(x, start_y + bounce_y),
+                Vec2::splat(dot_size),
+            );
+            let dot_color = if generating {
+                // Staggered breathe: each dot is phase-shifted.
+                let phase = (time_secs * std::f64::consts::TAU / 1.2 + i as f64 * 0.8).sin();
+                let alpha = 0.45 + 0.55 * ((phase as f32 + 1.0) / 2.0);
+                ACCENT.gamma_multiply(alpha)
+            } else if active {
+                FG_FAINT
+            } else {
+                GRID_LINE
+            };
+            painter.rect_filled(dot_rect, Rounding::ZERO, dot_color);
+        }
+    }
+    // Layout chip — bottom-left corner, showing "2x2" etc. like the design.
+    {
+        let chip_text = layout_label;
+        let chip_w = chip_text.len() as f32 * 5.5 + 6.0;
+        let chip_rect = egui::Rect::from_min_size(
+            response.rect.left_bottom() + Vec2::new(-2.0, -12.0),
+            Vec2::new(chip_w, 12.0),
+        );
+        painter.rect_filled(chip_rect, Rounding::ZERO, STRIP_BG);
+        painter.rect_stroke(chip_rect, Rounding::ZERO, Stroke::new(1.0, GRID_LINE));
+        painter.text(
+            chip_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            chip_text,
+            FontId::monospace(8.0),
+            FG_FAINT,
+        );
+    }
+
+    // Activity / generating markers live in the top-right area. Generating
+    // wins over the static "unread" dot.
     if generating {
         let painter = ui.painter();
         let center = response.rect.right_top() + Vec2::new(-12.0, 10.0);
         draw_generating_marker(painter, center, time_secs);
     } else if activity {
-        // Breathe the dot alpha with a sine in [0.55, 1.0] so inactive
-        // workspaces gently wave "come look" without distracting.
+        // Breathe the dot alpha with a sine in [0.55, 1.0]
         let phase = (time_secs * std::f64::consts::TAU / 1.6).sin();
         let alpha = 0.55 + 0.225 * (phase as f32 + 1.0);
-        let dot = ACTIVITY_DOT.gamma_multiply(alpha);
+        let dot = GREEN.gamma_multiply(alpha);
         let painter = ui.painter();
         let center = response.rect.right_top() + Vec2::new(-8.0, 8.0);
-        painter.circle_filled(center, ACTIVITY_DOT_RADIUS, dot);
+        painter.rect_filled(
+            egui::Rect::from_center_size(center, Vec2::splat(7.0)),
+            Rounding::ZERO,
+            dot,
+        );
     }
     response
 }
@@ -573,7 +978,7 @@ fn workspace_signals(ws: &Workspace, now: Instant) -> WorkspaceSignals {
 /// Draw a three-dot streaming indicator. Each dot fades up and down on its
 /// own phase so the trio reads as "…" in motion, a familiar "typing" cue.
 fn draw_generating_marker(painter: &egui::Painter, center: egui::Pos2, time_secs: f64) {
-    const DOT_RADIUS: f32 = 2.0;
+    const DOT_SIZE: f32 = 3.0;
     const SPACING: f32 = 5.0;
     // Period ≈ 1.2 s per cycle; stagger each dot by a third of the cycle.
     let period = 1.2;
@@ -582,11 +987,9 @@ fn draw_generating_marker(painter: &egui::Painter, center: egui::Pos2, time_secs
         // Remap sin from [-1, 1] to [0.35, 1.0].
         let alpha = 0.35 + 0.325 * (phase.sin() as f32 + 1.0);
         let dx = (i as f32 - 1.0) * SPACING;
-        painter.circle_filled(
-            center + Vec2::new(dx, 0.0),
-            DOT_RADIUS,
-            ACCENT.gamma_multiply(alpha),
-        );
+        let dot_pos = center + Vec2::new(dx, 0.0);
+        let dot_rect = egui::Rect::from_center_size(dot_pos, Vec2::splat(DOT_SIZE));
+        painter.rect_filled(dot_rect, Rounding::ZERO, ACCENT.gamma_multiply(alpha));
     }
 }
 
@@ -614,8 +1017,8 @@ fn paint_tile_drag_ghost(ctx: &egui::Context, ghost: &TileDragGhost) {
     let rect = egui::Rect::from_min_size(pos + Vec2::new(10.0, 6.0), size);
     painter.rect(
         rect,
-        Rounding::same(6.0),
-        CARD_BG_ACTIVE.gamma_multiply(0.95),
+        Rounding::ZERO,
+        BG_DIM.gamma_multiply(0.95),
         Stroke::new(1.0, ACCENT),
     );
     painter.text(
@@ -623,7 +1026,343 @@ fn paint_tile_drag_ghost(ctx: &egui::Context, ghost: &TileDragGhost) {
         egui::Align2::CENTER_CENTER,
         label,
         FontId::proportional(12.0),
-        CARD_FG_ACTIVE,
+        FG,
+    );
+}
+
+/// Decorative walker bird — a tiny amber "K" that hops rightward across
+/// the tile grid area every few seconds, cycling back to the left edge.
+/// Matches the design's WalkerBird component (14px, opacity 0.35).
+/// Includes koo-walk animation (1px jitter on hop phase).
+fn paint_walker_bird(ctx: &egui::Context, _now: Instant) {
+    let t = ctx.input(|i| i.time);
+    // Hop every 2 seconds, moving 32px per hop, cycling across 1200px.
+    let hop_x = (((t / 2.0) as u64 * 32) % 1200) as f32;
+    // Smooth cubic easing between hops for the last 1.5s of the 2s cycle.
+    let frac = (t % 2.0) / 2.0;
+    let ease = if frac < 0.75 {
+        // Resting phase
+        0.0
+    } else {
+        let p = (frac - 0.75) / 0.25;
+        p as f32 * p as f32 * (3.0 - 2.0 * p as f32) // smoothstep
+    };
+    let x = 40.0 + hop_x + ease * 32.0;
+    // koo-walk: subtle 1px shifts during hop (translateX(1px) translateY(-1px)).
+    let walk_phase = (t % 0.7) / 0.7;
+    let (walk_x, walk_y) = if walk_phase > 0.4 && walk_phase < 0.6 {
+        (1.0, -1.0)
+    } else {
+        (0.0, 0.0)
+    };
+    // Vertical bob: 1px up at mid-hop.
+    let bob_y = if ease > 0.2 && ease < 0.8 { -1.0 } else { 0.0 };
+    let y = (CHROME_BAR_HEIGHT + STRIP_HEIGHT + 80.0) + bob_y + walk_y;
+
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("kookaburra-walker-bird"),
+    ));
+    // Draw a tiny trail: 3 fading "footprints" behind the bird.
+    for step in 1..=3 {
+        let trail_alpha = 0.08 / step as f32;
+        let trail_x = x + walk_x - (step as f32 * 14.0);
+        if trail_x > 0.0 {
+            painter.text(
+                egui::pos2(trail_x, y + 2.0),
+                egui::Align2::CENTER_CENTER,
+                "·",
+                FontId::monospace(8.0),
+                ACCENT.gamma_multiply(trail_alpha),
+            );
+        }
+    }
+    painter.text(
+        egui::pos2(x + walk_x, y),
+        egui::Align2::CENTER_CENTER,
+        "K",
+        FontId::monospace(12.0),
+        ACCENT.gamma_multiply(0.3),
+    );
+}
+
+/// Tick the Kooka mascot's state: decide whether to hop, pick a target,
+/// fire speech bubbles, update mood.
+fn tick_kooka(
+    kooka: &mut KookaState,
+    tile_rects: &[CoreRect],
+    state: &AppState,
+    ctx: &egui::Context,
+) {
+    let t = ctx.input(|i| i.time);
+
+    // Clear expired phrases (visible for 2.4 seconds).
+    if kooka.phrase.is_some() && t - kooka.phrase_started > 2.4 {
+        kooka.phrase = None;
+    }
+
+    // Check if any tiles are generating.
+    let active_ws = state.workspace(state.active_workspace);
+    let generating_count = active_ws
+        .map(|ws| {
+            ws.tiles
+                .iter()
+                .filter(|tile| {
+                    tile.last_output_at
+                        .map(|at| Instant::now().saturating_duration_since(at)
+                            < Duration::from_millis(GENERATING_LATENCY_MS))
+                        .unwrap_or(false)
+                })
+                .count()
+        })
+        .unwrap_or(0);
+
+    // Update mood based on generating state.
+    if generating_count > 0 && kooka.mood == KookaMood::Idle {
+        kooka.mood = KookaMood::Watching;
+    } else if generating_count == 0 && kooka.mood == KookaMood::Watching {
+        kooka.mood = KookaMood::Cheering;
+        kooka.phrase = Some("all done!".to_string());
+        kooka.phrase_started = t;
+        // Cheering reverts to idle after 1.8s.
+    }
+    if kooka.mood == KookaMood::Cheering && t - kooka.phrase_started > 1.8 {
+        kooka.mood = KookaMood::Idle;
+    }
+
+    // Hop every ~4 seconds to a random tile header perch.
+    let hop_interval = 4.2;
+    if t - kooka.last_hop > hop_interval && !tile_rects.is_empty() {
+        // Pick a target tile. Prefer generating tiles 50% of the time,
+        // else random.
+        let target_idx = if generating_count > 0 && ((t * 1000.0) as u32 % 2 == 0) {
+            // Find a generating tile index.
+            active_ws
+                .and_then(|ws| {
+                    ws.tiles.iter().position(|tile| {
+                        tile.last_output_at
+                            .map(|at| Instant::now().saturating_duration_since(at)
+                                < Duration::from_millis(GENERATING_LATENCY_MS))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(0)
+        } else {
+            ((t * 7.0) as usize) % tile_rects.len()
+        };
+
+        if let Some(rect) = tile_rects.get(target_idx) {
+            // Perch: random x along top of tile, y just above tile header.
+            let margin = 20.0;
+            let w = rect.width;
+            let jitter = ((t * 137.0).sin().abs() as f32) * (w - margin * 2.0 - 32.0).max(0.0);
+            let new_x = rect.x + margin + jitter;
+            let new_y = rect.y - 32.0 - 6.0; // 32px sprite + 6px perch offset
+            kooka.dir = if new_x > kooka.x { 1.0 } else { -1.0 };
+            kooka.x = new_x;
+            kooka.y = new_y;
+            kooka.last_hop = t;
+            kooka.hop_count += 1;
+        }
+    }
+
+    // Every 5th hop triggers a laugh (HDAHAHAHAHA!).
+    if kooka.hop_count > 0 && kooka.hop_count % 5 == 0
+        && kooka.mood != KookaMood::Laugh
+        && t - kooka.last_hop < 0.1
+    {
+        kooka.mood = KookaMood::Laugh;
+        kooka.phrase = Some("HDAHAHAHAHA!".to_string());
+        kooka.phrase_started = t;
+    }
+    if kooka.mood == KookaMood::Laugh && t - kooka.phrase_started > 2.0 {
+        kooka.mood = KookaMood::Idle;
+    }
+
+    // Periodic tips: every ~8 seconds, 30% chance.
+    if t - kooka.last_tip > 8.0 && kooka.phrase.is_none() {
+        let roll = ((t * 31.0).sin().abs() as f32) < 0.3;
+        if roll {
+            let idx = ((t * 73.0) as usize) % KOOKA_TIPS.len();
+            kooka.phrase = Some(KOOKA_TIPS[idx].to_string());
+            kooka.phrase_started = t;
+            kooka.last_tip = t;
+        }
+    }
+}
+
+/// Paint the Kooka mascot as an egui overlay. The bird is rendered as a
+/// large amber "K" with mood-based animations, plus an optional speech
+/// bubble.
+fn paint_kooka(ctx: &egui::Context, kooka: &KookaState) {
+    let t = ctx.input(|i| i.time);
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("kookaburra-kooka-mascot"),
+    ));
+
+    let sprite_size = 32.0;
+
+    // Idle bob: gentle 1px sine bounce (koo-idle-bob).
+    let bob = if kooka.mood == KookaMood::Idle {
+        -1.0 * ((t * std::f64::consts::TAU / 2.2).sin() as f32)
+    } else {
+        0.0
+    };
+
+    // Cheering bounce: bigger, faster (koo-kooka-cheer).
+    let cheer_y = if kooka.mood == KookaMood::Cheering {
+        -3.0 * ((t * std::f64::consts::TAU / 0.5).sin() as f32)
+    } else {
+        0.0
+    };
+
+    // Watching tilt: subtle rotation approximated as x-offset oscillation.
+    let watch_x = if kooka.mood == KookaMood::Watching {
+        -2.0 * ((t * std::f64::consts::TAU / 1.8).sin() as f32)
+    } else {
+        0.0
+    };
+
+    // Laugh: bouncy jitter (koo-kooka-laugh: translateY(-2px) scaleY(0.92)).
+    let laugh_y = if kooka.mood == KookaMood::Laugh {
+        -2.0 * ((t * std::f64::consts::TAU / 0.3).sin() as f32).abs()
+    } else {
+        0.0
+    };
+
+    let bx = kooka.x + watch_x;
+    let by = kooka.y + bob + cheer_y + laugh_y;
+
+    // Shadow under bird.
+    let shadow_rect = egui::Rect::from_min_size(
+        egui::pos2(bx + sprite_size / 2.0 - 8.0, by + sprite_size + 4.0),
+        Vec2::new(16.0, 3.0),
+    );
+    painter.rect_filled(shadow_rect, Rounding::ZERO, Color32::from_rgba_premultiplied(5, 5, 5, 80));
+
+    // Bird sprite: a chunky amber "K" with glow.
+    let bird_center = egui::pos2(bx + sprite_size / 2.0, by + sprite_size / 2.0);
+    // Flip direction: we can't truly flip text, so we add an indicator.
+    let dir_char = if kooka.dir > 0.0 { "K>" } else { "<K" };
+    // Glow halo behind the bird (design: `filter: drop-shadow(0 0 2px accent/40%)`)
+    painter.text(
+        bird_center + Vec2::new(0.0, 1.0),
+        egui::Align2::CENTER_CENTER,
+        dir_char,
+        FontId::monospace(22.0),
+        ACCENT.gamma_multiply(0.15),
+    );
+    painter.text(
+        bird_center,
+        egui::Align2::CENTER_CENTER,
+        dir_char,
+        FontId::monospace(20.0),
+        ACCENT,
+    );
+
+    // Eye blink: a tiny dark square that appears briefly (koo-kooka-blink).
+    let blink_cycle = (t * 0.33) % 1.0; // ~3s cycle
+    if blink_cycle > 0.92 && blink_cycle < 0.97 {
+        let eye_pos = egui::pos2(
+            bx + sprite_size * 0.62,
+            by + sprite_size * 0.28,
+        );
+        painter.rect_filled(
+            egui::Rect::from_min_size(eye_pos, Vec2::splat(3.0)),
+            Rounding::ZERO,
+            BG_DEEP,
+        );
+    }
+
+    // Speech bubble.
+    if let Some(phrase) = &kooka.phrase {
+        let age = (t - kooka.phrase_started).min(2.4);
+        // Entrance animation: slide up + fade in during first 180ms.
+        let entrance = (age / 0.18).min(1.0) as f32;
+        let fade_out = if age > 2.0 { 1.0 - ((age - 2.0) / 0.4) as f32 } else { 1.0 };
+        let alpha = (entrance * fade_out).clamp(0.0, 1.0);
+
+        if alpha > 0.01 {
+            let slide_y = (1.0 - entrance) * 4.0;
+            let bubble_x = if kooka.dir > 0.0 {
+                bx + sprite_size + 6.0
+            } else {
+                bx - 170.0
+            };
+            let bubble_y = by - 22.0 + slide_y;
+            let bubble_w = (phrase.len() as f32 * 6.5 + 16.0).clamp(80.0, 220.0);
+            let bubble_rect = egui::Rect::from_min_size(
+                egui::pos2(bubble_x, bubble_y),
+                Vec2::new(bubble_w, 22.0),
+            );
+            painter.rect(
+                bubble_rect,
+                Rounding::ZERO,
+                BG_DEEP.gamma_multiply(alpha),
+                Stroke::new(2.0, ACCENT.gamma_multiply(alpha)),
+            );
+            painter.text(
+                bubble_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                phrase,
+                FontId::monospace(10.0),
+                FG.gamma_multiply(alpha),
+            );
+            // Pixel tail: small square pointing toward the bird.
+            let tail_x = if kooka.dir > 0.0 {
+                bubble_rect.left() - 4.0
+            } else {
+                bubble_rect.right()
+            };
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(tail_x, bubble_rect.bottom() - 8.0),
+                    Vec2::splat(4.0),
+                ),
+                Rounding::ZERO,
+                ACCENT.gamma_multiply(alpha),
+            );
+        }
+    }
+}
+
+/// Strip search-box placeholder — the design has "⌕ search all tiles… ⌘⇧F"
+/// as a read-only field in the strip. Actual search is Phase 7; this is
+/// decorative only.
+fn search_placeholder(ui: &mut egui::Ui) {
+    let height = 28.0;
+    let width = 160.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        Rounding::ZERO,
+        BG_DEEP,
+        Stroke::new(1.0, GRID_LINE),
+    );
+    // Left-aligned "⌕ search all tiles…" label
+    painter.text(
+        rect.left_center() + Vec2::new(8.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        "\u{2315} search all tiles\u{2026}",
+        FontId::monospace(10.0),
+        FG_FAINT,
+    );
+    // Right-aligned keyboard shortcut chip
+    let chip_w = 30.0;
+    let chip_h = 14.0;
+    let chip_rect = egui::Rect::from_min_size(
+        rect.right_center() + Vec2::new(-chip_w - 6.0, -chip_h / 2.0),
+        Vec2::new(chip_w, chip_h),
+    );
+    painter.rect(chip_rect, Rounding::ZERO, STRIP_BG, Stroke::new(1.0, GRID_LINE));
+    painter.text(
+        chip_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "\u{2318}\u{21e7}F",
+        FontId::monospace(8.0),
+        FG_FAINT,
     );
 }
 
@@ -631,14 +1370,135 @@ fn plus_button(ui: &mut egui::Ui) -> egui::Response {
     let size = Vec2::new(CARD_HEIGHT, CARD_HEIGHT);
     let button = Button::new(
         RichText::new("+")
-            .color(CARD_FG_INACTIVE)
+            .color(FG_DIM)
             .font(FontId::proportional(20.0)),
     )
-    .fill(CARD_BG)
-    .stroke(Stroke::NONE)
-    .rounding(Rounding::same(6.0))
+    .fill(BG_DEEP)
+    .stroke(Stroke::new(2.0, GRID_LINE))
+    .rounding(Rounding::ZERO)
     .min_size(size);
     ui.add_sized(size, button)
+}
+
+/// Build the status bar at the bottom of the window.
+fn build_status_bar(ctx: &egui::Context, state: &AppState, now: Instant) {
+    // Request periodic repaint for the pulsing ready dot + uptime clock.
+    ctx.request_repaint_after(ANIMATION_TICK);
+    egui::TopBottomPanel::bottom("kookaburra-status-bar")
+        .exact_height(22.0)
+        .frame(
+            Frame::none()
+                .fill(BG_DEEP)
+                .stroke(Stroke::new(1.0, GRID_LINE))
+                .inner_margin(egui::Margin::symmetric(10.0, 0.0)),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                // Active workspace dot + label
+                if let Some(active_ws) = state.workspace(state.active_workspace) {
+                    // Amber dot
+                    let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(6.0), Sense::hover());
+                    ui.painter().rect_filled(dot_rect, Rounding::ZERO, ACCENT);
+                    ui.label(
+                        RichText::new(&active_ws.label)
+                            .color(FG)
+                            .font(FontId::monospace(10.0)),
+                    );
+                }
+
+                // Separator
+                sep(ui);
+
+                // Tile count: "tile N/M"
+                if let Some(active_ws) = state.workspace(state.active_workspace) {
+                    let focused_idx = state.focused_tile
+                        .and_then(|fid| active_ws.tiles.iter().position(|t| t.id == fid))
+                        .unwrap_or(0) + 1;
+                    let total = active_ws.tiles.len();
+                    ui.label(
+                        RichText::new(format!("tile {focused_idx}/{total}"))
+                            .color(FG_DIM)
+                            .font(FontId::monospace(10.0)),
+                    );
+                }
+
+                sep(ui);
+
+                // Generating count
+                if let Some(active_ws) = state.workspace(state.active_workspace) {
+                    let generating_count = active_ws.tiles.iter().filter(|t| {
+                        if let Some(at) = t.last_output_at {
+                            now.saturating_duration_since(at) < Duration::from_millis(GENERATING_LATENCY_MS)
+                        } else {
+                            false
+                        }
+                    }).count();
+                    ui.label(
+                        RichText::new(format!("{generating_count} generating"))
+                            .color(FG_DIM)
+                            .font(FontId::monospace(10.0)),
+                    );
+                }
+
+                sep(ui);
+
+                // Layout label
+                if let Some(active_ws) = state.workspace(state.active_workspace) {
+                    ui.label(
+                        RichText::new(active_ws.layout.label())
+                            .color(FG_FAINT)
+                            .font(FontId::monospace(10.0)),
+                    );
+                }
+
+                // Flexible space → right-aligned section
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+
+                    // Pulsing "● ready" indicator — gentle sine breathe
+                    let t = ui.ctx().input(|i| i.time);
+                    let pulse = 0.7 + 0.3 * ((t * std::f64::consts::TAU / 2.0).sin() as f32);
+                    ui.label(
+                        RichText::new("● ready")
+                            .color(GREEN.gamma_multiply(pulse))
+                            .font(FontId::monospace(10.0)),
+                    );
+
+                    sep(ui);
+
+                    // Zen state indicator
+                    let zen_text = if state.zen_mode { "ZEN" } else { "zen" };
+                    let zen_color = if state.zen_mode { ACCENT } else { FG_DIM };
+                    ui.label(
+                        RichText::new(zen_text)
+                            .color(zen_color)
+                            .font(FontId::monospace(10.0)),
+                    );
+
+                    sep(ui);
+
+                    // Session uptime clock — uses egui's monotonic time.
+                    let t_secs = t;
+                    let mins = (t_secs / 60.0) as u64;
+                    let secs = (t_secs % 60.0) as u64;
+                    ui.label(
+                        RichText::new(format!("{mins:02}:{secs:02}"))
+                            .color(FG_FAINT)
+                            .font(FontId::monospace(10.0)),
+                    );
+                });
+            });
+        });
+}
+
+/// Status bar separator: "│" in grid-line color.
+fn sep(ui: &mut egui::Ui) {
+    ui.label(
+        RichText::new("│")
+            .color(GRID_LINE)
+            .font(FontId::monospace(10.0)),
+    );
 }
 
 /// Convenience: produce a `SwitchWorkspace` action. Lives here so unit
@@ -692,7 +1552,7 @@ fn resolve_reorder(
             egui::pos2(x - 1.5, strip_rect.top()),
             egui::pos2(x + 1.5, strip_rect.bottom()),
         );
-        painter.rect_filled(bar, Rounding::same(1.5), ACCENT);
+        painter.rect_filled(bar, Rounding::ZERO, ACCENT);
     }
 
     // Drop: primary button released while we had a drag in progress.

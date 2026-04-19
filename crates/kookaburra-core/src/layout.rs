@@ -24,6 +24,14 @@ impl Layout {
             Self::Grid { cols, rows } => (cols as usize) * (rows as usize),
         }
     }
+
+    /// Short human-readable label like "2x2", "3x2", "1x1".
+    #[must_use]
+    pub fn label(self) -> String {
+        match self {
+            Self::Grid { cols, rows } => format!("{cols}x{rows}"),
+        }
+    }
 }
 
 /// Computes per-tile rects in row-major order within the given `area`.

@@ -19,7 +19,7 @@ use kookaburra_core::worktree::WorktreeConfig;
 
 use kookaburra_pty::{PtyEvent, PtyEventSink, PtyManager, SpawnRequest};
 use kookaburra_render::{cells_in_rect, RenderTile, Renderer, UiFrame};
-use kookaburra_ui::{EventResponse, PreparedFrame, TileDragGhost, UiLayer, STRIP_HEIGHT};
+use kookaburra_ui::{EventResponse, PreparedFrame, TileDragGhost, UiLayer, CHROME_BAR_HEIGHT, STRIP_HEIGHT, STATUS_BAR_HEIGHT};
 
 use portable_pty::PtySize;
 use winit::application::ApplicationHandler;
@@ -179,12 +179,15 @@ impl App {
             .as_ref()
             .map(|w| w.scale_factor() as f32)
             .unwrap_or(1.0);
+        let chrome_px = CHROME_BAR_HEIGHT * scale;
         let strip_px = STRIP_HEIGHT * scale;
+        let status_bar_px = STATUS_BAR_HEIGHT * scale;
+        let top_px = chrome_px + strip_px;
         let area = Rect {
             x: WINDOW_INSET_PX,
-            y: strip_px + WINDOW_INSET_PX,
+            y: top_px + WINDOW_INSET_PX,
             width: (win_w as f32 - 2.0 * WINDOW_INSET_PX).max(1.0),
-            height: (win_h as f32 - strip_px - 2.0 * WINDOW_INSET_PX).max(1.0),
+            height: (win_h as f32 - top_px - status_bar_px - 2.0 * WINDOW_INSET_PX).max(1.0),
         };
         let mut rects = compute_tile_rects(layout, area);
         // Shrink each rect by the gap so neighboring tiles are visibly
@@ -196,14 +199,23 @@ impl App {
         rects
     }
 
-    /// Pick a PTY size for a tile occupying `rect`.
+    /// Pick a PTY size for a tile occupying `rect`. Subtracts the tile
+    /// header height (22px + 1px separator) from the available area so
+    /// terminal rows don't overflow the visible content region.
     fn pty_size_for_rect(&self, rect: Rect) -> PtySize {
         let metrics = self
             .renderer
             .as_ref()
             .map(|r| r.metrics)
             .unwrap_or_else(|| kookaburra_render::CellMetrics::fallback(self.config.font.size_px));
-        let (cols, rows) = cells_in_rect(rect, metrics);
+        let tile_header_px = 23.0; // 22px header + 1px separator
+        let content_rect = Rect {
+            x: rect.x,
+            y: rect.y + tile_header_px,
+            width: rect.width,
+            height: (rect.height - tile_header_px).max(1.0),
+        };
+        let (cols, rows) = cells_in_rect(content_rect, metrics);
         PtySize {
             rows,
             cols,
@@ -369,12 +381,15 @@ impl App {
             .as_ref()
             .map(|w| w.scale_factor() as f32)
             .unwrap_or(1.0);
+        let chrome_px = CHROME_BAR_HEIGHT * scale;
         let strip_px = STRIP_HEIGHT * scale;
+        let status_bar_px = STATUS_BAR_HEIGHT * scale;
+        let top_px = chrome_px + strip_px;
         let area = Rect {
             x: WINDOW_INSET_PX,
-            y: strip_px + WINDOW_INSET_PX,
+            y: top_px + WINDOW_INSET_PX,
             width: (win_w as f32 - 2.0 * WINDOW_INSET_PX).max(1.0),
-            height: (win_h as f32 - strip_px - 2.0 * WINDOW_INSET_PX).max(1.0),
+            height: (win_h as f32 - top_px - status_bar_px - 2.0 * WINDOW_INSET_PX).max(1.0),
         };
         self.render_scratch.clear();
         let theme = self.config.theme.clone();
@@ -408,24 +423,41 @@ impl App {
                 } else {
                     None
                 };
+                let zen_generating = tile.last_output_at
+                    .map(|at| std::time::Instant::now().saturating_duration_since(at) < std::time::Duration::from_millis(600))
+                    .unwrap_or(false);
+                let is_primary = self.state.active_workspace().primary_tile == Some(tile.id);
                 self.render_scratch.push(RenderTile {
                     tile_id: tile.id,
                     rect: area,
                     focused: true,
+                    generating: zen_generating,
+                    primary: is_primary,
+                    follow_mode: tile.follow_mode,
+                    tile_index: 1,
                     update,
                 });
             }
         } else {
             let layout = self.state.active_workspace().layout;
             let rects = compute_tile_rects(layout, area);
-            let tiles: Vec<(TileId, PtyId, String)> = self
+            let gen_window = std::time::Duration::from_millis(600);
+            let now = std::time::Instant::now();
+            let primary_tile = self.state.active_workspace().primary_tile;
+            let tiles: Vec<(TileId, PtyId, String, bool, bool, bool)> = self
                 .state
                 .active_workspace()
                 .tiles
                 .iter()
-                .map(|t| (t.id, t.pty_id, t.title.clone()))
+                .map(|t| {
+                    let generating = t.last_output_at
+                        .map(|at| now.saturating_duration_since(at) < gen_window)
+                        .unwrap_or(false);
+                    let is_primary = primary_tile == Some(t.id);
+                    (t.id, t.pty_id, t.title.clone(), generating, is_primary, t.follow_mode)
+                })
                 .collect();
-            for (i, (tile_id, pty_id, title)) in tiles.iter().enumerate() {
+            for (i, (tile_id, pty_id, title, tile_generating, tile_primary, tile_follow)) in tiles.iter().enumerate() {
                 let Some(r) = rects.get(i).copied() else {
                     break;
                 };
@@ -447,6 +479,10 @@ impl App {
                     tile_id: *tile_id,
                     rect: tile_rect,
                     focused: focused == Some(*tile_id),
+                    generating: *tile_generating,
+                    primary: *tile_primary,
+                    follow_mode: *tile_follow,
+                    tile_index: i + 1,
                     update,
                 });
             }
@@ -551,8 +587,9 @@ impl App {
             }
             return;
         }
-        // Dropped inside the strip but not on a card → spin out.
-        if (0.0..=STRIP_HEIGHT).contains(&logical_y) {
+        // Dropped inside the strip area (chrome + strip) but not on a card → spin out.
+        let top_area = CHROME_BAR_HEIGHT + STRIP_HEIGHT;
+        if (0.0..=top_area).contains(&logical_y) {
             self.actions
                 .push(Action::MoveTileToNewWorkspace { tile_id });
         }
@@ -692,6 +729,13 @@ impl App {
         });
         let ui = self.ui.as_mut()?;
         ui.set_tile_drag_ghost(ghost);
+        // Feed the Kooka mascot with current tile rects so it can hop
+        // between tile headers.
+        let kooka_rects = {
+            let layout = self.state.active_workspace().layout;
+            self.tile_rects(layout)
+        };
+        ui.set_tile_rects_for_kooka(&kooka_rects);
         Some(ui.run_frame(&window, &self.state, &mut self.actions))
     }
 
