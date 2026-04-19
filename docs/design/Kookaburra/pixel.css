@@ -1,0 +1,223 @@
+/* Pixel variant — true pixel-art overrides.
+ * We redefine typography + chrome to use hard, stepped pixel fonts and
+ * chunky 2-4px visual elements. Layout unchanged.
+ */
+
+/* Hard pixel fonts */
+@import url('https://fonts.googleapis.com/css2?family=VT323&family=Press+Start+2P&display=swap');
+
+html.px, html.px body {
+  background: #1a130e !important;
+  font-family: 'VT323', 'JetBrains Mono', monospace !important;
+  image-rendering: pixelated;
+  -webkit-font-smoothing: none;
+  -moz-osx-font-smoothing: grayscale;
+  font-smooth: never;
+}
+
+html.px body {
+  /* stepped dither instead of radial gradient */
+  background:
+    repeating-linear-gradient(0deg,
+      rgba(255,255,255,0.015) 0 2px, transparent 2px 4px),
+    #140e0a !important;
+}
+
+/* All text: bump up sizes (VT323 reads ~1.3x smaller than JetBrains)
+   and turn off antialiasing. */
+html.px * {
+  font-family: 'VT323', monospace !important;
+  letter-spacing: 0 !important;
+  -webkit-font-smoothing: none !important;
+}
+
+/* Monospace terminal body — still VT323 but slightly bigger */
+html.px .koo-terminal-body,
+html.px .koo-terminal-body * {
+  font-family: 'VT323', monospace !important;
+  font-size: 15px !important;
+  line-height: 17px !important;
+}
+
+/* Pixel-style headings via Press Start 2P, used only for the brand/window chrome */
+html.px .koo-brand-type {
+  font-family: 'Press Start 2P', monospace !important;
+  font-size: 8px !important;
+  letter-spacing: 2px !important;
+  line-height: 1.6 !important;
+}
+
+html.px .koo-chip-type {
+  font-family: 'Press Start 2P', monospace !important;
+  font-size: 6px !important;
+  letter-spacing: 1px !important;
+}
+
+/* Borders — disable anti-aliasing, force 2-3px chunky borders */
+html.px button,
+html.px .koo-tile,
+html.px .koo-card {
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
+
+/* dithered hover states via repeating conic or linear grads */
+html.px .koo-dither-bg {
+  background-image:
+    repeating-linear-gradient(45deg,
+      rgba(255,255,255,0.04) 0 2px,
+      transparent 2px 4px) !important;
+}
+
+/* pixel shadow: hard stepped drop shadow instead of soft shadow */
+html.px .koo-tile {
+  box-shadow:
+    2px 2px 0 rgba(0,0,0,0.9),
+    4px 4px 0 rgba(0,0,0,0.45) !important;
+}
+
+html.px .koo-card {
+  box-shadow:
+    2px 2px 0 rgba(0,0,0,0.8) !important;
+}
+
+/* cursor: chunky block, no subpixel */
+html.px .koo-cursor,
+html.px .koo-cursor-block {
+  font-family: 'VT323', monospace !important;
+  font-size: 16px !important;
+}
+
+/* turn off all transitions that blur on fractional pixels; step animations */
+html.px button,
+html.px .koo-card {
+  transition: none !important;
+}
+
+/* Traffic lights → chunky square pixels (override fractional padding) */
+html.px .koo-traffic > * {
+  border-radius: 0 !important;
+}
+
+/* scanline overlay for that CRT feel */
+html.px .koo-app::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    repeating-linear-gradient(0deg,
+      rgba(0,0,0,0.15) 0 1px,
+      transparent 1px 3px);
+  mix-blend-mode: multiply;
+  z-index: 100;
+}
+
+html.px .koo-app::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse at center,
+      transparent 40%,
+      rgba(0,0,0,0.35) 100%);
+  z-index: 101;
+}
+
+/* dithered generating pulse */
+html.px .koo-gen-dot {
+  background-image:
+    repeating-linear-gradient(45deg,
+      currentColor 0 2px,
+      transparent 2px 4px) !important;
+}
+
+/* Kooka — upscale sprite pixels */
+html.px .koo-kooka-sprite img {
+  image-rendering: pixelated !important;
+  image-rendering: -moz-crisp-edges !important;
+}
+
+/* chunky speech bubble with thicker border + corner notches */
+html.px .koo-bubble {
+  border-width: 3px !important;
+  font-family: 'VT323', monospace !important;
+  font-size: 14px !important;
+  padding: 6px 10px !important;
+  box-shadow: 3px 3px 0 rgba(0,0,0,0.9) !important;
+}
+
+/* workspace card: chunky pixel outline */
+html.px .koo-card {
+  border-width: 3px !important;
+}
+
+/* tile borders: 3px pixel */
+html.px .koo-tile {
+  border-width: 3px !important;
+}
+
+/* Kooka shadow → chunky pixel square */
+html.px .koo-kooka-shadow {
+  border-radius: 0 !important;
+  width: 20px !important;
+  height: 4px !important;
+}
+
+/* progress bars and hr all become pixel stepped */
+html.px input[type="range"]::-webkit-slider-thumb {
+  border-radius: 0 !important;
+  background: oklch(0.80 0.17 68) !important;
+  width: 12px !important;
+  height: 12px !important;
+}
+
+/* Dither the strip background */
+html.px .koo-strip {
+  background-image:
+    repeating-linear-gradient(0deg,
+      rgba(255,255,255,0.02) 0 1px,
+      transparent 1px 3px) !important;
+}
+
+/* stepped keyframes — replace smooth ones for animations that leak */
+html.px .koo-kooka-sprite {
+  animation-timing-function: steps(4) !important;
+}
+
+/* tile header — re-tuned for VT323 (wider line-height, needs bigger gaps) */
+html.px .koo-tile-header {
+  height: 28px !important;
+  gap: 12px !important;
+  padding: 0 10px !important;
+}
+
+html.px .koo-tile-header > * {
+  font-size: 12px !important;
+  line-height: 14px !important;
+  white-space: nowrap !important;
+  flex-shrink: 0;
+}
+
+/* Title gets the flexible space but must be allowed to shrink past content */
+html.px .koo-tile-title {
+  flex: 1 1 0 !important;
+  min-width: 0 !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+}
+
+/* Running chip — add a visible pipe separator after it in pixel mode
+   (VT323 renders U+00B7 middot as near-nothing, so titles look fused) */
+html.px .koo-tile-run::after {
+  content: "\2502";  /* box-drawing light vertical */
+  margin-left: 10px;
+  opacity: 0.35;
+  color: currentColor;
+}
+
+/* new-output indicator on card = dithered chunky dot */
+html.px .koo-tile-dot {
+  image-rendering: pixelated;
+}

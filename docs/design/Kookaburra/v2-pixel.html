@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en" class="px">
+<head>
+<meta charset="utf-8" />
+<title>Kookaburra — pixel variant</title>
+<meta name="viewport" content="width=1440, initial-scale=1" />
+<link rel="icon" href="assets/kookaburra.svg" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    background: oklch(0.12 0.008 60);
+    color: oklch(0.94 0.008 85);
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    min-height: 100vh;
+    overflow-x: auto;
+  }
+  body {
+    background:
+      radial-gradient(ellipse at 50% 0%, oklch(0.20 0.015 60) 0%, oklch(0.10 0.006 60) 70%);
+    padding: 28px;
+    box-sizing: border-box;
+  }
+  * { box-sizing: border-box; }
+  button { font-family: inherit; }
+  button:focus { outline: none; }
+
+  img, svg { image-rendering: pixelated; }
+
+  /* ─── animations (same as v1 but stepped via pixel.css) ─── */
+  @keyframes koo-pulse {
+    0%, 100% { opacity: 1;   transform: scale(1); }
+    50%      { opacity: 0.5; transform: scale(0.7); }
+  }
+  @keyframes koo-bounce {
+    0%, 100% { transform: translateY(0); }
+    50%      { transform: translateY(-3px); }
+  }
+  @keyframes koo-drip {
+    0%   { height: 0;   opacity: 1; }
+    70%  { height: 48px; opacity: 1; }
+    100% { height: 48px; opacity: 0; }
+  }
+  @keyframes koo-seam {
+    0%   { background-position: 0 0; }
+    100% { background-position: 16px 0; }
+  }
+  @keyframes koo-walk {
+    0%, 100% { transform: translateX(0); }
+    50%      { transform: translateX(1px) translateY(-1px); }
+  }
+  @keyframes koo-peck {
+    0%, 80%, 100% { transform: rotate(0deg); }
+    85%           { transform: rotate(16deg); }
+    90%           { transform: rotate(-6deg); }
+  }
+  @keyframes koo-blink {
+    0%, 49% { opacity: 1; }
+    50%, 100% { opacity: 0; }
+  }
+  @keyframes koo-glitch {
+    0%, 100% { clip-path: inset(0 0 0 0); }
+    20% { clip-path: inset(10% 0 20% 0); transform: translateX(-2px); }
+    40% { clip-path: inset(40% 0 5% 0); transform: translateX(2px); }
+    60% { clip-path: inset(0 0 60% 0); transform: translateX(-1px); }
+  }
+  @keyframes koo-ws-squish {
+    0%   { transform: scaleX(0.6) scaleY(1.15); }
+    60%  { transform: scaleX(1.08) scaleY(0.94); }
+    100% { transform: scaleX(1) scaleY(1); }
+  }
+  @keyframes koo-idle-bob {
+    0%, 100% { transform: translateY(0); }
+    50%      { transform: translateY(-1px); }
+  }
+  @keyframes koo-kooka-watch {
+    0%, 100% { transform: rotate(0deg); }
+    45% { transform: rotate(-6deg); }
+    55% { transform: rotate(-6deg); }
+  }
+  @keyframes koo-kooka-cheer {
+    0%, 100% { transform: translateY(0) rotate(-4deg); }
+    50%      { transform: translateY(-3px) rotate(4deg); }
+  }
+  @keyframes koo-kooka-laugh {
+    0%, 100% { transform: translateY(0) scaleY(1); }
+    50%      { transform: translateY(-2px) scaleY(0.92); }
+  }
+  @keyframes koo-kooka-blink {
+    0%, 92% { opacity: 0; }
+    93%, 97% { opacity: 1; }
+    98%, 100% { opacity: 0; }
+  }
+  @keyframes koo-bubble-in {
+    0% { transform: translateY(4px) scale(0.8); opacity: 0; }
+    100% { transform: translateY(0) scale(1); opacity: 1; }
+  }
+
+  .koo-cursor { animation: koo-blink 1s steps(2) infinite; }
+
+  .koo-strip-scroll::-webkit-scrollbar { height: 6px; }
+  .koo-strip-scroll::-webkit-scrollbar-thumb { background: oklch(0.28 0.012 60); }
+  .koo-strip-scroll::-webkit-scrollbar-track { background: transparent; }
+</style>
+<link rel="stylesheet" href="pixel.css">
+</head>
+<body>
+<div id="app"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script src="data.js"></script>
+<script type="text/babel" src="components.jsx"></script>
+<script type="text/babel" src="kooka.jsx"></script>
+<script type="text/babel" src="app.jsx"></script>
+
+</body>
+</html>
