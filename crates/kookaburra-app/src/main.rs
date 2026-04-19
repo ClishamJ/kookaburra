@@ -163,7 +163,7 @@ impl App {
 
     fn active_pty(&self) -> Option<PtyId> {
         let tile_id = self.active_tile()?;
-        self.state.tile(tile_id).map(|t| t.pty_id)
+        self.state.tile(tile_id)?.pty_id
     }
 
     /// Physical-pixel rect of the area tiles can occupy this frame.
@@ -357,7 +357,7 @@ impl App {
         if lines == 0 {
             return;
         }
-        let Some(pty_id) = self.state.tile(tile_id).map(|t| t.pty_id) else {
+        let Some(pty_id) = self.state.tile(tile_id).and_then(|t| t.pty_id) else {
             return;
         };
         if self.pty_manager.scroll(pty_id, lines) {
@@ -418,10 +418,12 @@ impl App {
             let tile = self.state.tile(tile_id).cloned();
             if let Some(tile) = tile {
                 let update = if self.dirty_tiles.contains(&tile.id) {
-                    let mut snap = TileSnapshot::new(tile.id);
-                    self.pty_manager.snapshot(tile.pty_id, &theme, &mut snap);
-                    snap.title = tile.title.clone();
-                    Some(snap)
+                    tile.pty_id.map(|pty_id| {
+                        let mut snap = TileSnapshot::new(tile.id);
+                        self.pty_manager.snapshot(pty_id, &theme, &mut snap);
+                        snap.title = tile.title.clone();
+                        snap
+                    })
                 } else {
                     None
                 };
@@ -446,7 +448,7 @@ impl App {
             let gen_window = std::time::Duration::from_millis(600);
             let now = std::time::Instant::now();
             let primary_tile = self.state.active_workspace().primary_tile;
-            let tiles: Vec<(TileId, PtyId, String, bool, bool, bool)> = self
+            let tiles: Vec<(TileId, Option<PtyId>, String, bool, bool, bool)> = self
                 .state
                 .active_workspace()
                 .tiles
@@ -459,9 +461,12 @@ impl App {
                     (t.id, t.pty_id, t.title.clone(), generating, is_primary, t.follow_mode)
                 })
                 .collect();
-            for (i, (tile_id, pty_id, title, tile_generating, tile_primary, tile_follow)) in tiles.iter().enumerate() {
+            for (i, (tile_id, pty_id_opt, title, tile_generating, tile_primary, tile_follow)) in tiles.iter().enumerate() {
                 let Some(r) = rects.get(i).copied() else {
                     break;
+                };
+                let Some(pty_id) = *pty_id_opt else {
+                    continue;
                 };
                 let tile_rect = Rect {
                     x: r.x,
@@ -471,7 +476,7 @@ impl App {
                 };
                 let update = if self.dirty_tiles.contains(tile_id) {
                     let mut snap = TileSnapshot::new(*tile_id);
-                    self.pty_manager.snapshot(*pty_id, &theme, &mut snap);
+                    self.pty_manager.snapshot(pty_id, &theme, &mut snap);
                     snap.title = title.clone();
                     Some(snap)
                 } else {
@@ -788,7 +793,7 @@ impl App {
             .tiles
             .iter()
             .enumerate()
-            .map(|(i, t)| (i, t.pty_id))
+            .filter_map(|(i, t)| t.pty_id.map(|pid| (i, pid)))
             .collect();
         for (i, pid) in tiles {
             let Some(r) = rects.get(i).copied() else {

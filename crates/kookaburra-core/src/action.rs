@@ -119,9 +119,10 @@ pub fn apply_action(state: &mut AppState, pty: &mut dyn PtySideEffects, action: 
             state.focused_tile = None;
         }
         Action::DeleteWorkspace(id) => {
-            // Close every PTY that belonged to the workspace.
+            // Close every live PTY that belonged to the workspace. Empty
+            // slots have no PTY to kill.
             if let Some(ws) = state.workspace(id) {
-                let pty_ids: Vec<PtyId> = ws.tiles.iter().map(|t| t.pty_id).collect();
+                let pty_ids: Vec<PtyId> = ws.tiles.iter().filter_map(|t| t.pty_id).collect();
                 for p in pty_ids {
                     pty.close(p);
                 }
@@ -166,22 +167,12 @@ pub fn apply_action(state: &mut AppState, pty: &mut dyn PtySideEffects, action: 
             }
         }
         Action::CloseTile(tile_id) => {
-            // Find the pty + workspace for this tile.
-            let mut found: Option<(WorkspaceId, PtyId)> = None;
-            for ws in &state.workspaces {
-                if let Some(t) = ws.tile(tile_id) {
-                    found = Some((ws.id, t.pty_id));
-                    break;
-                }
-            }
-            if let Some((ws_id, pty_id)) = found {
-                pty.close(pty_id);
-                if let Some(ws) = state.workspace_mut(ws_id) {
-                    ws.remove_tile(tile_id);
-                }
-                if state.focused_tile == Some(tile_id) {
-                    let first = state.active_workspace().tiles.first().map(|t| t.id);
-                    state.focused_tile = first;
+            // Demote a live slot back to empty. The slot itself stays —
+            // the user can click / press Enter to instantiate a fresh
+            // terminal in its place. No-op on slots that are already empty.
+            if let Some(tile) = state.tile_mut(tile_id) {
+                if let Some(pty_id) = tile.demote() {
+                    pty.close(pty_id);
                 }
             }
         }
@@ -305,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn close_tile_closes_pty_and_removes_tile() {
+    fn close_tile_demotes_slot_to_empty_and_closes_pty() {
         let mut state = AppState::new(Config::default());
         let mut pty = StubPty::default();
         let ws_id = state.active_workspace;
@@ -318,9 +309,28 @@ mod tests {
             },
         );
         let tile_id = state.active_workspace().tiles[0].id;
+        assert!(state.tile(tile_id).unwrap().is_live());
+
         apply_action(&mut state, &mut pty, Action::CloseTile(tile_id));
         assert_eq!(pty.closes, 1);
-        assert!(state.active_workspace().tiles.is_empty());
+        // Slot stays. Just the PTY is gone.
+        assert_eq!(state.active_workspace().tiles.len(), 1);
+        assert!(!state.tile(tile_id).unwrap().is_live());
+    }
+
+    #[test]
+    fn close_tile_on_empty_slot_is_noop() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        // Hand-insert an empty tile so we can target it (CreateTile would
+        // spawn a live one).
+        let empty = Tile::empty();
+        let empty_id = empty.id;
+        state.active_workspace_mut().push_tile(empty);
+
+        apply_action(&mut state, &mut pty, Action::CloseTile(empty_id));
+        assert_eq!(pty.closes, 0, "no PTY to close for empty slot");
+        assert_eq!(state.active_workspace().tiles.len(), 1);
     }
 
     #[test]

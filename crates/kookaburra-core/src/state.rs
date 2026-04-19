@@ -156,13 +156,16 @@ impl Workspace {
     }
 }
 
-/// A single terminal pane within a workspace.
+/// A single slot within a workspace. A slot with `pty_id == Some(_)` is
+/// live (a terminal is running in it). A slot with `pty_id == None` is an
+/// empty placeholder — rendered as a "+" box that the user can click or
+/// focus+Enter to instantiate.
 #[derive(Clone, Debug)]
 pub struct Tile {
     pub id: TileId,
-    pub pty_id: PtyId,
+    pub pty_id: Option<PtyId>,
     /// Title as set by the shell via OSC sequences. Updated by the PTY
-    /// event drain.
+    /// event drain. Empty string for empty slots.
     pub title: String,
     /// Set whenever the PTY produces output; cleared when the user
     /// interacts with the tile.
@@ -185,7 +188,7 @@ pub struct Tile {
 }
 
 impl Tile {
-    /// Build a fresh tile wired to an existing PTY. The tile's id is
+    /// Build a fresh live tile wired to an existing PTY. The tile's id is
     /// auto-generated; use [`Tile::with_id`] when you need to decide the
     /// id up-front (e.g. so a PTY event listener can tag events with the
     /// same id before the tile is inserted into state).
@@ -194,14 +197,12 @@ impl Tile {
         Self::with_id(TileId::new(), pty_id)
     }
 
-    /// Build a tile with an explicit id. Used by `apply_action::CreateTile`
-    /// so the `TileId` passed to `PtySideEffects::spawn` matches the id of
-    /// the resulting `Tile`.
+    /// Build a live tile with an explicit id.
     #[must_use]
     pub fn with_id(id: TileId, pty_id: PtyId) -> Self {
         Self {
             id,
-            pty_id,
+            pty_id: Some(pty_id),
             title: String::new(),
             has_new_output: false,
             follow_mode: true,
@@ -210,6 +211,70 @@ impl Tile {
             bell_pending: false,
             last_output_at: None,
         }
+    }
+
+    /// Build an empty placeholder slot with a fresh id.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            id: TileId::new(),
+            pty_id: None,
+            title: String::new(),
+            has_new_output: false,
+            follow_mode: true,
+            cwd: None,
+            worktree: None,
+            bell_pending: false,
+            last_output_at: None,
+        }
+    }
+
+    /// True if this slot currently hosts a running PTY.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        self.pty_id.is_some()
+    }
+
+    /// Promote an empty slot to live with the given PTY. Caller is
+    /// responsible for having called [`PtySideEffects::spawn`] first.
+    /// No-op if already live.
+    pub fn promote(&mut self, pty_id: PtyId) {
+        if self.pty_id.is_none() {
+            self.pty_id = Some(pty_id);
+        }
+    }
+
+    /// Demote a live slot back to empty, returning the former `PtyId` so
+    /// the caller can close it. No-op and returns `None` if already empty.
+    /// All live-state fields (title, worktree, output flags, etc.) are
+    /// reset so the slot looks freshly minted.
+    pub fn demote(&mut self) -> Option<PtyId> {
+        let pty = self.pty_id.take()?;
+        self.title.clear();
+        self.worktree = None;
+        self.has_new_output = false;
+        self.cwd = None;
+        self.last_output_at = None;
+        self.bell_pending = false;
+        self.follow_mode = true;
+        Some(pty)
+    }
+
+    /// Move the live state of `src` into `self`. `self` must be empty;
+    /// `src` is left empty. Both retain their original `TileId`s — this is
+    /// how `MoveTile` relocates a terminal across workspaces without
+    /// disturbing slot identity.
+    pub fn take_live_state_from(&mut self, src: &mut Tile) {
+        debug_assert!(self.pty_id.is_none(), "destination slot must be empty");
+        debug_assert!(src.pty_id.is_some(), "source slot must be live");
+        self.pty_id = src.pty_id.take();
+        self.title = std::mem::take(&mut src.title);
+        self.worktree = src.worktree.take();
+        self.has_new_output = std::mem::replace(&mut src.has_new_output, false);
+        self.cwd = src.cwd.take();
+        self.last_output_at = src.last_output_at.take();
+        self.bell_pending = std::mem::replace(&mut src.bell_pending, false);
+        self.follow_mode = std::mem::replace(&mut src.follow_mode, true);
     }
 
     /// Attach worktree metadata to a tile that was created in worktree
@@ -277,5 +342,87 @@ mod tests {
         tile.has_new_output = true;
         s.active_workspace_mut().push_tile(tile);
         assert!(s.any_tile_dirty());
+    }
+
+    #[test]
+    fn empty_tile_has_no_pty_and_default_fields() {
+        let t = Tile::empty();
+        assert!(!t.is_live());
+        assert!(t.pty_id.is_none());
+        assert_eq!(t.title, "");
+        assert!(t.worktree.is_none());
+        assert!(!t.has_new_output);
+        assert!(t.follow_mode, "follow_mode defaults true so new terminals auto-scroll");
+    }
+
+    #[test]
+    fn live_tile_reports_is_live() {
+        let t = Tile::new(dummy_pty());
+        assert!(t.is_live());
+        assert!(t.pty_id.is_some());
+    }
+
+    #[test]
+    fn promote_fills_empty_slot() {
+        let mut t = Tile::empty();
+        let pty = dummy_pty();
+        t.promote(pty);
+        assert!(t.is_live());
+        assert_eq!(t.pty_id, Some(pty));
+    }
+
+    #[test]
+    fn promote_is_noop_on_live_slot() {
+        let first = dummy_pty();
+        let second = dummy_pty();
+        let mut t = Tile::new(first);
+        t.promote(second);
+        assert_eq!(t.pty_id, Some(first), "second promote should not clobber existing PTY");
+    }
+
+    #[test]
+    fn demote_clears_fields_and_returns_former_pty() {
+        let pty = dummy_pty();
+        let mut t = Tile::new(pty);
+        t.title = "shell".into();
+        t.has_new_output = true;
+        t.bell_pending = true;
+        t.last_output_at = Some(Instant::now());
+
+        let returned = t.demote();
+        assert_eq!(returned, Some(pty));
+        assert!(!t.is_live());
+        assert_eq!(t.title, "");
+        assert!(!t.has_new_output);
+        assert!(!t.bell_pending);
+        assert!(t.last_output_at.is_none());
+        assert!(t.follow_mode, "follow_mode resets to default");
+    }
+
+    #[test]
+    fn demote_on_empty_slot_returns_none() {
+        let mut t = Tile::empty();
+        assert!(t.demote().is_none());
+        assert!(!t.is_live());
+    }
+
+    #[test]
+    fn take_live_state_from_relocates_pty_and_keeps_both_ids() {
+        let pty = dummy_pty();
+        let mut src = Tile::new(pty);
+        src.title = "shell".into();
+        let src_id = src.id;
+
+        let mut dest = Tile::empty();
+        let dest_id = dest.id;
+
+        dest.take_live_state_from(&mut src);
+
+        assert_eq!(dest.pty_id, Some(pty));
+        assert_eq!(dest.title, "shell");
+        assert_eq!(dest.id, dest_id, "destination keeps its slot TileId");
+        assert!(!src.is_live());
+        assert_eq!(src.title, "");
+        assert_eq!(src.id, src_id, "source keeps its slot TileId");
     }
 }
