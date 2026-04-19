@@ -115,14 +115,19 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// New empty workspace with a default 3×2 grid layout.
+    /// New workspace with a default 3×2 grid layout. Tiles are pre-filled
+    /// with `layout.cell_count()` empty slots so the grid is visible from
+    /// the moment the workspace exists — users instantiate a slot by
+    /// clicking it or by focusing it and pressing Enter.
     #[must_use]
     pub fn new(label: impl Into<String>) -> Self {
+        let layout = Layout::Grid { cols: 3, rows: 2 };
+        let tiles = (0..layout.cell_count()).map(|_| Tile::empty()).collect();
         Self {
             id: WorkspaceId::new(),
             label: label.into(),
-            layout: Layout::Grid { cols: 3, rows: 2 },
-            tiles: Vec::new(),
+            layout,
+            tiles,
             primary_tile: None,
         }
     }
@@ -295,12 +300,30 @@ mod tests {
     }
 
     #[test]
-    fn new_state_has_one_workspace_no_tiles() {
+    fn new_state_has_one_workspace_full_of_empty_slots() {
         let s = AppState::new(Config::default());
         assert_eq!(s.workspaces.len(), 1);
-        assert!(s.active_workspace().tiles.is_empty());
+        let ws = s.active_workspace();
+        assert_eq!(ws.tiles.len(), ws.layout.cell_count());
+        assert!(ws.tiles.iter().all(|t| !t.is_live()));
         assert_eq!(s.focused_tile, None);
         assert!(!s.zen_mode);
+    }
+
+    #[test]
+    fn workspace_new_fills_tiles_with_cell_count_empties() {
+        let ws = Workspace::new("scratch");
+        assert_eq!(ws.tiles.len(), ws.layout.cell_count());
+        assert!(ws.tiles.iter().all(|t| !t.is_live()));
+        assert!(ws.tiles.iter().all(|t| t.title.is_empty()));
+        assert!(ws.primary_tile.is_none());
+    }
+
+    #[test]
+    fn workspace_new_gives_each_empty_slot_a_unique_id() {
+        let ws = Workspace::new("scratch");
+        let ids: std::collections::HashSet<_> = ws.tiles.iter().map(|t| t.id).collect();
+        assert_eq!(ids.len(), ws.tiles.len(), "slot IDs must be unique");
     }
 
     #[test]
@@ -312,15 +335,16 @@ mod tests {
     #[test]
     fn tile_insert_and_remove_roundtrips() {
         let mut s = AppState::new(Config::default());
+        let starting_len = s.active_workspace().tiles.len();
         let tile = Tile::new(dummy_pty());
         let tile_id = tile.id;
         s.active_workspace_mut().push_tile(tile);
-        assert_eq!(s.active_workspace().tiles.len(), 1);
+        assert_eq!(s.active_workspace().tiles.len(), starting_len + 1);
         assert!(s.tile(tile_id).is_some());
 
         let removed = s.active_workspace_mut().remove_tile(tile_id);
         assert!(removed.is_some());
-        assert!(s.active_workspace().tiles.is_empty());
+        assert_eq!(s.active_workspace().tiles.len(), starting_len);
         assert!(s.tile(tile_id).is_none());
     }
 
@@ -342,6 +366,12 @@ mod tests {
         tile.has_new_output = true;
         s.active_workspace_mut().push_tile(tile);
         assert!(s.any_tile_dirty());
+    }
+
+    #[test]
+    fn any_tile_dirty_is_false_when_workspace_is_all_empty_slots() {
+        let s = AppState::new(Config::default());
+        assert!(!s.any_tile_dirty(), "empty slots never have new output");
     }
 
     #[test]

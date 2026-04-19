@@ -31,7 +31,6 @@ use winit::window::{Window, WindowId};
 
 const DEFAULT_WIDTH: u32 = 1400;
 const DEFAULT_HEIGHT: u32 = 900;
-const STARTER_TILES: usize = 6;
 const TILE_GAP_PX: f32 = 6.0;
 const WINDOW_INSET_PX: f32 = 8.0;
 /// Pointer-drag threshold in physical pixels. Below this, a press/release
@@ -239,7 +238,9 @@ impl App {
         }
     }
 
-    /// Spawn the starter tiles (currently 6 to fill a 3×2 grid).
+    /// Promote the top-left slot of workspace 1 to a live tile at startup.
+    /// The other five slots remain empty placeholders until the user
+    /// instantiates them (click or focus+Enter).
     fn ensure_starter_tiles(&mut self) {
         if self.starter_spawned {
             return;
@@ -251,37 +252,44 @@ impl App {
             .map(|w| w.layout)
             .unwrap_or(Layout::Grid { cols: 3, rows: 2 });
         let rects = self.tile_rects(layout);
-        for i in 0..STARTER_TILES {
-            let size = rects
-                .get(i)
-                .copied()
-                .map(|r| self.pty_size_for_rect(r))
-                .unwrap_or(PtySize {
-                    rows: 24,
-                    cols: 80,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                });
-            let mut adapter = PtyAdapter {
-                manager: &mut self.pty_manager,
-                default_size: size,
-            };
-            apply_action(
-                &mut self.state,
-                &mut adapter,
-                Action::CreateTile {
-                    workspace: ws,
-                    worktree: None,
-                },
-            );
-        }
-        // Focus the first tile.
-        let first = self.state.active_workspace().tiles.first().map(|t| t.id);
-        self.state.focused_tile = first;
-        // Every starter tile needs its initial shaping pass.
-        for tile in &self.state.active_workspace().tiles {
-            self.dirty_tiles.insert(tile.id);
-        }
+        // Size the PTY to the first tile's rect so the initial shell sees
+        // the correct window before the first resize lands.
+        let size = rects
+            .first()
+            .copied()
+            .map(|r| self.pty_size_for_rect(r))
+            .unwrap_or(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        let Some(first_tile_id) = self
+            .state
+            .workspace(ws)
+            .and_then(|w| w.tiles.first().map(|t| t.id))
+        else {
+            // Workspace::new pre-fills slots; if this ever empties out we
+            // want to know.
+            log::error!("starter workspace has no slots");
+            return;
+        };
+        let mut adapter = PtyAdapter {
+            manager: &mut self.pty_manager,
+            default_size: size,
+        };
+        apply_action(
+            &mut self.state,
+            &mut adapter,
+            Action::SpawnInTile {
+                tile_id: first_tile_id,
+                worktree: None,
+            },
+        );
+        // Focus the freshly spawned tile (SpawnInTile already sets it, but
+        // be explicit for readers).
+        self.state.focused_tile = Some(first_tile_id);
+        self.dirty_tiles.insert(first_tile_id);
         self.starter_spawned = true;
     }
 
@@ -670,11 +678,21 @@ impl App {
 
         match lower {
             't' => {
-                let ws = self.state.active_workspace;
-                self.actions.push(Action::CreateTile {
-                    workspace: ws,
-                    worktree: None,
-                });
+                // Cmd+T: promote the first empty slot in the active
+                // workspace. No-op if the grid is already full.
+                let first_empty = self
+                    .state
+                    .active_workspace()
+                    .tiles
+                    .iter()
+                    .find(|t| !t.is_live())
+                    .map(|t| t.id);
+                if let Some(tile_id) = first_empty {
+                    self.actions.push(Action::SpawnInTile {
+                        tile_id,
+                        worktree: None,
+                    });
+                }
                 true
             }
             'w' => {

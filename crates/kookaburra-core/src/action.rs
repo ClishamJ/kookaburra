@@ -40,8 +40,12 @@ pub enum Action {
     },
 
     // Tiles
-    CreateTile {
-        workspace: WorkspaceId,
+    /// Promote an empty slot to a live tile. `tile_id` must name an
+    /// existing slot; if the slot is already live the action is a no-op.
+    /// The UI should emit this when the user clicks (or focus+Enter) an
+    /// empty placeholder, and during bootstrap to fill the starter tile.
+    SpawnInTile {
+        tile_id: TileId,
         worktree: Option<WorktreeConfig>,
     },
     CloseTile(TileId),
@@ -92,6 +96,17 @@ pub trait PtySideEffects {
     fn spawn(&mut self, tile_id: TileId, worktree: Option<&WorktreeConfig>) -> PtyId;
     /// Close a PTY. Best-effort; failures should be logged, not returned.
     fn close(&mut self, pty: PtyId);
+}
+
+/// Locate a tile across all workspaces by its id. Returns
+/// `(workspace_index, tile_index)` if found.
+fn find_tile_loc(state: &AppState, tile_id: TileId) -> Option<(usize, usize)> {
+    for (wi, ws) in state.workspaces.iter().enumerate() {
+        if let Some(ti) = ws.tiles.iter().position(|t| t.id == tile_id) {
+            return Some((wi, ti));
+        }
+    }
+    None
 }
 
 /// The only mutation site for `AppState`. Keep this a pure function over
@@ -152,16 +167,17 @@ pub fn apply_action(state: &mut AppState, pty: &mut dyn PtySideEffects, action: 
                 state.workspaces.insert(to, item);
             }
         }
-        Action::CreateTile {
-            workspace,
-            worktree,
-        } => {
-            if state.workspace(workspace).is_some() {
-                let tile_id = TileId::new();
+        Action::SpawnInTile { tile_id, worktree } => {
+            // Promote an empty slot to live. No-op if the tile doesn't
+            // resolve or the slot is already live.
+            let is_empty_slot = state
+                .tile(tile_id)
+                .map(|t| !t.is_live())
+                .unwrap_or(false);
+            if is_empty_slot {
                 let pty_id = pty.spawn(tile_id, worktree.as_ref());
-                let tile = Tile::with_id(tile_id, pty_id);
-                if let Some(ws) = state.workspace_mut(workspace) {
-                    ws.push_tile(tile);
+                if let Some(tile) = state.tile_mut(tile_id) {
+                    tile.promote(pty_id);
                 }
                 state.focused_tile = Some(tile_id);
             }
@@ -188,36 +204,64 @@ pub fn apply_action(state: &mut AppState, pty: &mut dyn PtySideEffects, action: 
             tile_id,
             target_workspace,
         } => {
-            // Pull the tile out of its current workspace.
-            let mut extracted: Option<Tile> = None;
-            for ws in state.workspaces.iter_mut() {
-                if ws.tile(tile_id).is_some() {
-                    extracted = ws.remove_tile(tile_id);
-                    break;
-                }
+            // Find the source slot.
+            let Some((src_wi, src_ti)) = find_tile_loc(state, tile_id) else {
+                return;
+            };
+            // Moving an empty slot has no meaning.
+            if !state.workspaces[src_wi].tiles[src_ti].is_live() {
+                return;
             }
-            if let (Some(tile), Some(ws)) = (extracted, state.workspace_mut(target_workspace)) {
-                ws.push_tile(tile);
+            // Resolve destination workspace.
+            let Some(dst_wi) = state
+                .workspaces
+                .iter()
+                .position(|w| w.id == target_workspace)
+            else {
+                return;
+            };
+            if src_wi == dst_wi {
+                return;
             }
+            // Find first empty slot in destination.
+            let Some(dst_ti) = state.workspaces[dst_wi]
+                .tiles
+                .iter()
+                .position(|t| !t.is_live())
+            else {
+                // No room in the destination; spec treats this as a no-op.
+                return;
+            };
+            // Take the source tile out, leave a fresh empty in its place.
+            let moved = std::mem::replace(
+                &mut state.workspaces[src_wi].tiles[src_ti],
+                Tile::empty(),
+            );
+            // Replace the destination's empty slot with the moved tile.
+            // The moved Tile keeps its TileId so the PTY's event listener
+            // (which tagged events with that id at spawn time) continues
+            // to land on the right slot.
+            state.workspaces[dst_wi].tiles[dst_ti] = moved;
         }
         Action::MoveTileToNewWorkspace { tile_id } => {
-            // Extract the tile from whichever workspace holds it.
-            let mut extracted: Option<Tile> = None;
-            for ws in state.workspaces.iter_mut() {
-                if ws.tile(tile_id).is_some() {
-                    extracted = ws.remove_tile(tile_id);
-                    break;
-                }
+            let Some((src_wi, src_ti)) = find_tile_loc(state, tile_id) else {
+                return;
+            };
+            if !state.workspaces[src_wi].tiles[src_ti].is_live() {
+                return;
             }
-            if let Some(tile) = extracted {
-                let idx = state.workspaces.len() + 1;
-                let mut ws = Workspace::new(format!("workspace {idx}"));
-                let new_ws_id = ws.id;
-                ws.push_tile(tile);
-                state.workspaces.push(ws);
-                state.active_workspace = new_ws_id;
-                state.focused_tile = Some(tile_id);
-            }
+            let moved = std::mem::replace(
+                &mut state.workspaces[src_wi].tiles[src_ti],
+                Tile::empty(),
+            );
+            let idx = state.workspaces.len() + 1;
+            let mut ws = Workspace::new(format!("workspace {idx}"));
+            let new_ws_id = ws.id;
+            // Slot 0 of the new workspace receives the moved tile.
+            ws.tiles[0] = moved;
+            state.workspaces.push(ws);
+            state.active_workspace = new_ws_id;
+            state.focused_tile = Some(tile_id);
         }
         Action::SetPrimaryTile { workspace, tile } => {
             if let Some(ws) = state.workspace_mut(workspace) {
@@ -278,43 +322,82 @@ mod tests {
     }
 
     #[test]
-    fn create_tile_spawns_pty_and_inserts_tile() {
+    fn spawn_in_tile_promotes_empty_slot_and_focuses() {
         let mut state = AppState::new(Config::default());
         let mut pty = StubPty::default();
-        let ws_id = state.active_workspace;
+        let tile_id = state.active_workspace().tiles[0].id;
         apply_action(
             &mut state,
             &mut pty,
-            Action::CreateTile {
-                workspace: ws_id,
+            Action::SpawnInTile {
+                tile_id,
                 worktree: None,
             },
         );
         assert_eq!(pty.spawns, 1);
-        assert_eq!(state.active_workspace().tiles.len(), 1);
-        assert!(state.focused_tile.is_some());
+        assert!(state.tile(tile_id).unwrap().is_live());
+        assert_eq!(state.focused_tile, Some(tile_id));
+    }
+
+    #[test]
+    fn spawn_in_tile_is_noop_on_already_live_slot() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let tile_id = state.active_workspace().tiles[0].id;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SpawnInTile {
+                tile_id,
+                worktree: None,
+            },
+        );
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SpawnInTile {
+                tile_id,
+                worktree: None,
+            },
+        );
+        assert_eq!(pty.spawns, 1, "second SpawnInTile on live slot is no-op");
+    }
+
+    #[test]
+    fn spawn_in_tile_with_unknown_id_is_noop() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SpawnInTile {
+                tile_id: TileId::new(),
+                worktree: None,
+            },
+        );
+        assert_eq!(pty.spawns, 0);
+        assert_eq!(state.focused_tile, None);
     }
 
     #[test]
     fn close_tile_demotes_slot_to_empty_and_closes_pty() {
         let mut state = AppState::new(Config::default());
         let mut pty = StubPty::default();
-        let ws_id = state.active_workspace;
+        let tile_id = state.active_workspace().tiles[0].id;
         apply_action(
             &mut state,
             &mut pty,
-            Action::CreateTile {
-                workspace: ws_id,
+            Action::SpawnInTile {
+                tile_id,
                 worktree: None,
             },
         );
-        let tile_id = state.active_workspace().tiles[0].id;
         assert!(state.tile(tile_id).unwrap().is_live());
 
         apply_action(&mut state, &mut pty, Action::CloseTile(tile_id));
         assert_eq!(pty.closes, 1);
-        // Slot stays. Just the PTY is gone.
-        assert_eq!(state.active_workspace().tiles.len(), 1);
+        // Slot stays, just the PTY is gone.
+        assert!(state.tile(tile_id).is_some());
         assert!(!state.tile(tile_id).unwrap().is_live());
     }
 
@@ -322,34 +405,30 @@ mod tests {
     fn close_tile_on_empty_slot_is_noop() {
         let mut state = AppState::new(Config::default());
         let mut pty = StubPty::default();
-        // Hand-insert an empty tile so we can target it (CreateTile would
-        // spawn a live one).
-        let empty = Tile::empty();
-        let empty_id = empty.id;
-        state.active_workspace_mut().push_tile(empty);
-
+        let empty_id = state.active_workspace().tiles[0].id;
+        assert!(!state.tile(empty_id).unwrap().is_live());
         apply_action(&mut state, &mut pty, Action::CloseTile(empty_id));
         assert_eq!(pty.closes, 0, "no PTY to close for empty slot");
-        assert_eq!(state.active_workspace().tiles.len(), 1);
+        assert!(state.tile(empty_id).is_some(), "slot still present");
     }
 
     #[test]
-    fn create_tile_passes_same_tile_id_to_spawn_and_tile() {
-        // Regression: if apply_action generates the TileId *after* calling
-        // spawn, the PTY's event proxy is tagged with a stale id and no
-        // PtyEvent::OutputReceived will ever find its tile.
+    fn spawn_in_tile_passes_tile_id_to_pty() {
+        // Regression: the PTY's event proxy must be tagged with the same
+        // TileId that will carry the tile in AppState. If apply_action
+        // minted a fresh id after spawning, events would never find their
+        // tile.
         let mut state = AppState::new(Config::default());
         let mut pty = StubPty::default();
-        let ws_id = state.active_workspace;
+        let tile_id = state.active_workspace().tiles[0].id;
         apply_action(
             &mut state,
             &mut pty,
-            Action::CreateTile {
-                workspace: ws_id,
+            Action::SpawnInTile {
+                tile_id,
                 worktree: None,
             },
         );
-        let tile_id = state.active_workspace().tiles[0].id;
         assert_eq!(pty.last_spawn_tile, Some(tile_id));
     }
 
@@ -375,12 +454,26 @@ mod tests {
     }
 
     #[test]
-    fn delete_last_workspace_reseeds_with_empty_one() {
+    fn create_workspace_yields_workspace_of_empty_slots() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        apply_action(&mut state, &mut pty, Action::CreateWorkspace);
+        let new_ws = state.active_workspace();
+        assert_eq!(new_ws.tiles.len(), new_ws.layout.cell_count());
+        assert!(new_ws.tiles.iter().all(|t| !t.is_live()));
+        assert_eq!(pty.spawns, 0, "creating a workspace shouldn't spawn PTYs");
+    }
+
+    #[test]
+    fn delete_last_workspace_reseeds_with_empty_slots() {
         let mut state = AppState::new(Config::default());
         let mut pty = StubPty::default();
         let only = state.active_workspace;
         apply_action(&mut state, &mut pty, Action::DeleteWorkspace(only));
         assert_eq!(state.workspaces.len(), 1);
+        let ws = state.active_workspace();
+        assert_eq!(ws.tiles.len(), ws.layout.cell_count());
+        assert!(ws.tiles.iter().all(|t| !t.is_live()));
     }
 
     #[test]
@@ -388,15 +481,15 @@ mod tests {
         let mut state = AppState::new(Config::default());
         let mut pty = StubPty::default();
         let source = state.active_workspace;
+        let tile_id = state.active_workspace().tiles[0].id;
         apply_action(
             &mut state,
             &mut pty,
-            Action::CreateTile {
-                workspace: source,
+            Action::SpawnInTile {
+                tile_id,
                 worktree: None,
             },
         );
-        let tile_id = state.active_workspace().tiles[0].id;
         let before = state.workspaces.len();
         apply_action(
             &mut state,
@@ -404,12 +497,20 @@ mod tests {
             Action::MoveTileToNewWorkspace { tile_id },
         );
         assert_eq!(state.workspaces.len(), before + 1);
-        assert_eq!(state.active_workspace().tiles.len(), 1);
-        assert_eq!(state.active_workspace().tiles[0].id, tile_id);
+        let new_ws = state.active_workspace();
+        assert_eq!(new_ws.tiles.len(), new_ws.layout.cell_count());
+        assert!(new_ws.tiles[0].is_live());
+        assert_eq!(new_ws.tiles[0].id, tile_id, "moved tile keeps its id");
+        assert!(
+            new_ws.tiles[1..].iter().all(|t| !t.is_live()),
+            "remaining slots are empty"
+        );
         assert_ne!(state.active_workspace, source);
         assert_eq!(state.focused_tile, Some(tile_id));
-        // Source workspace is now empty.
-        assert!(state.workspace(source).unwrap().tiles.is_empty());
+        // Source keeps its slot count; the slot we moved from is now empty.
+        let src = state.workspace(source).unwrap();
+        assert_eq!(src.tiles.len(), src.layout.cell_count());
+        assert!(src.tiles.iter().all(|t| !t.is_live()));
     }
 
     #[test]
@@ -417,15 +518,15 @@ mod tests {
         let mut state = AppState::new(Config::default());
         let mut pty = StubPty::default();
         let source = state.active_workspace;
+        let tile_id = state.active_workspace().tiles[0].id;
         apply_action(
             &mut state,
             &mut pty,
-            Action::CreateTile {
-                workspace: source,
+            Action::SpawnInTile {
+                tile_id,
                 worktree: None,
             },
         );
-        let tile_id = state.active_workspace().tiles[0].id;
         apply_action(&mut state, &mut pty, Action::CreateWorkspace);
         let target = state.active_workspace;
         apply_action(
@@ -436,17 +537,130 @@ mod tests {
                 target_workspace: target,
             },
         );
-        assert_eq!(
-            state
-                .workspace(source)
-                .expect("source workspace still there")
-                .tiles
-                .len(),
-            0
+        // Source: all slots still there, all empty.
+        let src = state.workspace(source).unwrap();
+        assert_eq!(src.tiles.len(), src.layout.cell_count());
+        assert!(src.tiles.iter().all(|t| !t.is_live()));
+        // Target: first empty slot now live with the moved tile; rest empty.
+        let tgt = state.workspace(target).unwrap();
+        assert_eq!(tgt.tiles.len(), tgt.layout.cell_count());
+        assert!(tgt.tiles[0].is_live());
+        assert_eq!(tgt.tiles[0].id, tile_id);
+        assert!(tgt.tiles[1..].iter().all(|t| !t.is_live()));
+    }
+
+    #[test]
+    fn move_tile_into_full_destination_is_noop() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let source = state.active_workspace;
+        let source_tile_id = state.active_workspace().tiles[0].id;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SpawnInTile {
+                tile_id: source_tile_id,
+                worktree: None,
+            },
+        );
+        // Fill up a second workspace so it has no empty slots.
+        apply_action(&mut state, &mut pty, Action::CreateWorkspace);
+        let target = state.active_workspace;
+        let target_slot_ids: Vec<TileId> = state
+            .workspace(target)
+            .unwrap()
+            .tiles
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        for id in &target_slot_ids {
+            apply_action(
+                &mut state,
+                &mut pty,
+                Action::SpawnInTile {
+                    tile_id: *id,
+                    worktree: None,
+                },
+            );
+        }
+
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::MoveTile {
+                tile_id: source_tile_id,
+                target_workspace: target,
+            },
+        );
+        // Source still has the live tile; target unchanged.
+        let src = state.workspace(source).unwrap();
+        assert!(
+            src.tiles.iter().any(|t| t.id == source_tile_id && t.is_live()),
+            "source tile stayed put — target had no empty slot"
         );
         assert_eq!(
-            state.workspace(target).expect("target exists").tiles.len(),
-            1
+            state.workspace(target).unwrap().tiles.len(),
+            target_slot_ids.len()
         );
+    }
+
+    #[test]
+    fn move_tile_within_same_workspace_is_noop() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let ws_id = state.active_workspace;
+        let tile_id = state.active_workspace().tiles[0].id;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SpawnInTile {
+                tile_id,
+                worktree: None,
+            },
+        );
+        let before_tiles = state.workspace(ws_id).unwrap().tiles.len();
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::MoveTile {
+                tile_id,
+                target_workspace: ws_id,
+            },
+        );
+        let after = state.workspace(ws_id).unwrap();
+        assert_eq!(after.tiles.len(), before_tiles);
+        assert!(after.tiles[0].is_live());
+        assert_eq!(after.tiles[0].id, tile_id);
+    }
+
+    #[test]
+    fn move_tile_on_empty_slot_is_noop() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let source = state.active_workspace;
+        let empty_id = state.active_workspace().tiles[0].id;
+        apply_action(&mut state, &mut pty, Action::CreateWorkspace);
+        let target = state.active_workspace;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::MoveTile {
+                tile_id: empty_id,
+                target_workspace: target,
+            },
+        );
+        // Nothing changed.
+        assert!(state
+            .workspace(source)
+            .unwrap()
+            .tiles
+            .iter()
+            .any(|t| t.id == empty_id));
+        assert!(state
+            .workspace(target)
+            .unwrap()
+            .tiles
+            .iter()
+            .all(|t| !t.is_live()));
     }
 }
