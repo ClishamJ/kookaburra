@@ -80,33 +80,37 @@ impl Theme {
         }
     }
 
-    /// Warm Kookaburra amber palette theme.
+    /// Warm Kookaburra amber palette — derived from the design system's
+    /// OKLCH values in `docs/design/Kookaburra/data.js`. Background is
+    /// near-black with a warm brown tint; foreground is a warm off-white.
+    /// ANSI 0..15 map to the design's `red/green/yellow/blue/magenta/teal`
+    /// plus brighter variants (L bumped by ~+0.08).
     #[must_use]
     pub fn kookaburra() -> Self {
         Self {
             name: "Kookaburra",
-            foreground: Rgba::rgb(0xf0, 0xed, 0xe8),
-            background: Rgba::rgb(0x2b, 0x24, 0x20),
-            cursor: Rgba::rgb(0xd4, 0xa0, 0x40),
-            selection_bg: Rgba::rgb(0xd4, 0xa0, 0x40), // translucent amber
+            foreground: Rgba::rgb(0xee, 0xeb, 0xe5),   // fg
+            background: Rgba::rgb(0x08, 0x06, 0x04),   // bg — near-pure-black, warm tint
+            cursor: Rgba::rgb(0xff, 0xa5, 0x1c),       // accent amber
+            selection_bg: Rgba::rgb(0xff, 0xa5, 0x1c), // accent (alpha applied at paint time)
             ansi: [
-                Rgba::rgb(0x20, 0x1c, 0x18), // black (bgDeep)
-                Rgba::rgb(0xd0, 0x50, 0x40), // red
-                Rgba::rgb(0x78, 0xc8, 0x50), // green
-                Rgba::rgb(0xd8, 0xc0, 0x48), // yellow
-                Rgba::rgb(0x58, 0x88, 0xd8), // blue
-                Rgba::rgb(0xc8, 0x68, 0xb8), // magenta
-                Rgba::rgb(0x5c, 0xb8, 0xb8), // cyan (teal)
-                Rgba::rgb(0xf0, 0xed, 0xe8), // white
-                // bright variants
-                Rgba::rgb(0x36, 0x30, 0x2a), // bright black (bgDim)
-                Rgba::rgb(0xe8, 0x70, 0x58), // bright red
-                Rgba::rgb(0x8f, 0xd8, 0x68), // bright green
-                Rgba::rgb(0xf0, 0xd8, 0x60), // bright yellow
-                Rgba::rgb(0x78, 0xa8, 0xf0), // bright blue
-                Rgba::rgb(0xe0, 0x88, 0xd0), // bright magenta
-                Rgba::rgb(0x7c, 0xd8, 0xd8), // bright cyan
-                Rgba::rgb(0xf8, 0xf5, 0xf0), // bright white
+                Rgba::rgb(0x04, 0x03, 0x02), // 0 black     → bgDeep
+                Rgba::rgb(0xfa, 0x68, 0x63), // 1 red
+                Rgba::rgb(0x6e, 0xd2, 0x74), // 2 green
+                Rgba::rgb(0xf5, 0xcc, 0x58), // 3 yellow
+                Rgba::rgb(0x4d, 0xac, 0xf6), // 4 blue
+                Rgba::rgb(0xdb, 0x7c, 0xd4), // 5 magenta
+                Rgba::rgb(0x48, 0xb7, 0xbd), // 6 cyan (teal)
+                Rgba::rgb(0xee, 0xeb, 0xe5), // 7 white (fg)
+                // bright variants: same hues, L + ~0.08
+                Rgba::rgb(0x2d, 0x28, 0x23), // 8 bright black → gridLine
+                Rgba::rgb(0xff, 0x82, 0x7b), // 9 bright red
+                Rgba::rgb(0x89, 0xec, 0x8d), // 10 bright green
+                Rgba::rgb(0xff, 0xe0, 0x6d), // 11 bright yellow
+                Rgba::rgb(0x68, 0xc6, 0xff), // 12 bright blue
+                Rgba::rgb(0xf6, 0x95, 0xee), // 13 bright magenta
+                Rgba::rgb(0x64, 0xd1, 0xd7), // 14 bright cyan
+                Rgba::rgb(0xfb, 0xf8, 0xf2), // 15 bright white
             ],
         }
     }
@@ -129,7 +133,7 @@ impl Default for FontConfig {
     fn default() -> Self {
         Self {
             family: "Menlo".to_string(),
-            size_px: 14.0,
+            size_px: 15.0,
         }
     }
 }

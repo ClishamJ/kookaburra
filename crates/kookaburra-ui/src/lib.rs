@@ -29,10 +29,11 @@ use kookaburra_core::state::{AppState, Workspace};
 /// pauses between tokens. 600 ms is comfortably above inter-token jitter
 /// without keeping the marker lit during purely idle sessions.
 const GENERATING_LATENCY_MS: u64 = 600;
-/// How often we re-request a frame while an animation is visible. 50 ms ≈
-/// 20 fps — plenty for breathing alpha / moving dots, cheap enough to not
-/// matter for a mostly-idle UI.
-const ANIMATION_TICK: Duration = Duration::from_millis(50);
+/// How often we re-request a frame while an animation is visible. 16 ms ≈
+/// 60 fps — matches egui's default scheduler and a 60 Hz display so
+/// breathing alpha / moving dots / drag ghosts read smoothly. Still
+/// coalesced by egui, so an idle UI with no animations doesn't repaint.
+const ANIMATION_TICK: Duration = Duration::from_millis(16);
 
 /// Strip dimensions per spec §3 ("Card dimensions: ~140×48px").
 pub const STRIP_HEIGHT: f32 = 56.0;
@@ -41,20 +42,22 @@ pub const CARD_HEIGHT: f32 = 44.0;
 /// Status bar height at bottom of window.
 pub const STATUS_BAR_HEIGHT: f32 = 22.0;
 
-/// Kookaburra warm amber palette
-const STRIP_BG: Color32 = Color32::from_rgb(0x2b, 0x24, 0x20);      // bg
-const BG_DEEP: Color32 = Color32::from_rgb(0x20, 0x1c, 0x18);       // bgDeep
-const BG_DIM: Color32 = Color32::from_rgb(0x36, 0x30, 0x2a);        // bgDim
-const FG: Color32 = Color32::from_rgb(0xf0, 0xed, 0xe8);            // fg
-const FG_DIM: Color32 = Color32::from_rgb(0xa9, 0xa4, 0x9d);        // fgDim
-const FG_FAINT: Color32 = Color32::from_rgb(0x76, 0x72, 0x6c);      // fgFaint
-const ACCENT: Color32 = Color32::from_rgb(0xd4, 0xa0, 0x40);        // kookaburra amber
+/// Kookaburra warm amber palette — OKLCH-derived from
+/// `docs/design/Kookaburra/data.js`. Background is near-black with a
+/// warm tint; amber (`ACCENT`) is the signature kookaburra highlight.
+const STRIP_BG: Color32 = Color32::from_rgb(0x08, 0x06, 0x04);      // bg (near-black)
+const BG_DEEP: Color32 = Color32::from_rgb(0x04, 0x03, 0x02);       // bgDeep
+const BG_DIM: Color32 = Color32::from_rgb(0x12, 0x0d, 0x09);        // bgDim (active card)
+const FG: Color32 = Color32::from_rgb(0xee, 0xeb, 0xe5);            // fg
+const FG_DIM: Color32 = Color32::from_rgb(0x9c, 0x98, 0x90);        // fgDim
+const FG_FAINT: Color32 = Color32::from_rgb(0x61, 0x5d, 0x56);      // fgFaint
+const ACCENT: Color32 = Color32::from_rgb(0xff, 0xa5, 0x1c);        // kookaburra amber
 #[allow(dead_code)]
-const ACCENT_DEEP: Color32 = Color32::from_rgb(0x8f, 0x60, 0x20);   // darker beak
+const ACCENT_DEEP: Color32 = Color32::from_rgb(0xc2, 0x56, 0x00);   // darker beak
 #[allow(dead_code)]
-const TEAL: Color32 = Color32::from_rgb(0x5c, 0xb8, 0xb8);          // worktree
-const GREEN: Color32 = Color32::from_rgb(0x78, 0xc8, 0x50);         // activity dot
-const GRID_LINE: Color32 = Color32::from_rgb(0x48, 0x40, 0x3a);     // gridLine
+const TEAL: Color32 = Color32::from_rgb(0x48, 0xb7, 0xbd);          // worktree
+const GREEN: Color32 = Color32::from_rgb(0x6e, 0xd2, 0x74);         // activity dot
+const GRID_LINE: Color32 = Color32::from_rgb(0x1a, 0x15, 0x10);     // gridLine (very subtle)
 
 /// Routing decision for an input event.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -74,6 +77,12 @@ pub struct PreparedFrame {
     pub primitives: Vec<egui::ClippedPrimitive>,
     pub textures_delta: egui::TexturesDelta,
     pub pixels_per_point: f32,
+    /// How long egui wants to wait before the next repaint. `Duration::MAX`
+    /// means "no animation pending — sleep until the next input event."
+    /// Anything shorter means a widget is animating (breathing dots, drag
+    /// ghost, etc.) and the app should schedule a wake-up so animations
+    /// don't stall between input events.
+    pub repaint_delay: Duration,
 }
 
 /// Ephemeral state for the inline rename editor. Lives on `UiLayer`
@@ -319,11 +328,21 @@ impl UiLayer {
         self.winit_state
             .handle_platform_output(window, full_output.platform_output);
         let pixels_per_point = ctx.pixels_per_point();
+        // Pull egui's next-repaint deadline for ROOT. Animations
+        // (breathing dots, squish, drag ghost) set this via
+        // `ctx.request_repaint_after`; without surfacing it to the event
+        // loop, animations stall until the next input event wakes us.
+        let repaint_delay = full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.repaint_delay)
+            .unwrap_or(Duration::MAX);
         let primitives = ctx.tessellate(full_output.shapes, pixels_per_point);
         PreparedFrame {
             primitives,
             textures_delta: full_output.textures_delta,
             pixels_per_point,
+            repaint_delay,
         }
     }
 }

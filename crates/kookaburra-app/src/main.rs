@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kookaburra_core::action::{apply_action, Action, PtySideEffects};
 use kookaburra_core::config::Config;
@@ -983,6 +983,12 @@ impl ApplicationHandler<PtyEvent> for App {
             self.apply_pending_actions();
         }
 
+        // If egui has a finite repaint deadline (strip animations, drag
+        // ghost, squish), render this frame and schedule the next wake-up.
+        // Without this, animations only advance when a PTY / input event
+        // happens to wake the loop — hence the stuttery "laggy" feel.
+        let animation_delay = ui_frame.as_ref().map(|f| f.repaint_delay);
+
         // Render INLINE here rather than calling `request_redraw()` and
         // waiting for winit to deliver `RedrawRequested` on the next loop
         // turn. That round-trip was adding a full event-loop wakeup of
@@ -990,10 +996,21 @@ impl ApplicationHandler<PtyEvent> for App {
         // asked winit to schedule a redraw, winit then woke the loop a
         // second time to deliver RedrawRequested, and only then did we
         // render. Rendering here collapses the round-trip.
-        if self.state.needs_redraw && self.renderer.is_some() {
+        let animating = animation_delay.is_some_and(|d| d < Duration::MAX);
+        if (self.state.needs_redraw || animating) && self.renderer.is_some() {
             self.render_if_needed(ui_frame);
         }
-        event_loop.set_control_flow(ControlFlow::Wait);
+
+        // Schedule the next wake-up: the soonest of egui's animation
+        // deadline (if any) or winit's default `Wait`. Zero delay → Poll
+        // so the next frame runs immediately.
+        match animation_delay {
+            Some(d) if d.is_zero() => event_loop.set_control_flow(ControlFlow::Poll),
+            Some(d) if d < Duration::MAX => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + d));
+            }
+            _ => event_loop.set_control_flow(ControlFlow::Wait),
+        }
     }
 }
 

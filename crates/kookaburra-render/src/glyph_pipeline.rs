@@ -84,11 +84,10 @@ struct Uniforms {
 
 /// Pack an `Rgba` (sRGB 8-bit channels) into little-endian `u32` such
 /// that byte 0 = r, byte 1 = g, byte 2 = b, byte 3 = a. The shader's
-/// `unpack_rgba` reverses this. Note: colors are sampled in sRGB and the
-/// fragment shader outputs premultiplied *linear-ish* values — because
-/// the surface is `Bgra8UnormSrgb`, hardware handles the conversion on
-/// write. For the terminal grid this is close enough; text colors match
-/// native Terminal.app visually.
+/// `unpack_rgba` reverses this and converts the RGB channels from sRGB
+/// to linear so the `Bgra8UnormSrgb` surface's linear->sRGB encoding
+/// round-trips to the original byte values. Egui-wgpu does the same
+/// conversion, so tile and strip colors agree byte-for-byte.
 #[inline]
 fn pack_rgba(c: Rgba) -> u32 {
     (c.r as u32) | ((c.g as u32) << 8) | ((c.b as u32) << 16) | ((c.a as u32) << 24)

@@ -31,12 +31,31 @@ fn pixel_to_clip(px: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(x, y, 0.0, 1.0);
 }
 
+// Convert one sRGB-encoded channel in [0, 1] to its linear equivalent.
+// The surface format is `Bgra8UnormSrgb`: the hardware encodes linear ->
+// sRGB on write. Without this conversion here, sRGB byte 0x08 (intended
+// near-black) comes out the framebuffer as ~0x32 — a warm brown — because
+// the shader output is treated as linear. Egui-wgpu does the same
+// conversion internally, so doing it here keeps tile colors byte-identical
+// to the strip.
+fn srgb_channel_to_linear(c: f32) -> f32 {
+    if (c <= 0.04045) {
+        return c / 12.92;
+    }
+    return pow((c + 0.055) / 1.055, 2.4);
+}
+
 fn unpack_rgba(c: u32) -> vec4<f32> {
     let r = f32((c      ) & 0xffu) / 255.0;
     let g = f32((c >>  8u) & 0xffu) / 255.0;
     let b = f32((c >> 16u) & 0xffu) / 255.0;
     let a = f32((c >> 24u) & 0xffu) / 255.0;
-    return vec4<f32>(r, g, b, a);
+    return vec4<f32>(
+        srgb_channel_to_linear(r),
+        srgb_channel_to_linear(g),
+        srgb_channel_to_linear(b),
+        a,
+    );
 }
 
 // --- Background pass ---------------------------------------------------
