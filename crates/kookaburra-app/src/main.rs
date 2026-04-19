@@ -324,6 +324,25 @@ impl App {
         if ev.state != ElementState::Pressed {
             return;
         }
+        let Some(tile_id) = self.active_tile() else {
+            return;
+        };
+        // Empty slot: Enter instantiates it; everything else is ignored
+        // (Cmd-shortcuts are already handled upstream by handle_app_shortcut).
+        let slot_is_live = self
+            .state
+            .tile(tile_id)
+            .map(|t| t.is_live())
+            .unwrap_or(false);
+        if !slot_is_live {
+            if let Key::Named(NamedKey::Enter) = &ev.logical_key {
+                self.actions.push(Action::SpawnInTile {
+                    tile_id,
+                    worktree: None,
+                });
+            }
+            return;
+        }
         let Some(pty_id) = self.active_pty() else {
             return;
         };
