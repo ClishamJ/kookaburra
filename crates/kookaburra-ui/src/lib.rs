@@ -21,7 +21,6 @@ use winit::window::Window;
 
 use kookaburra_core::action::Action;
 use kookaburra_core::ids::WorkspaceId;
-use kookaburra_core::layout::Rect as CoreRect;
 use kookaburra_core::state::{AppState, Workspace};
 
 /// Bytes arriving on a tile within this window treat it as "actively
@@ -35,8 +34,6 @@ const GENERATING_LATENCY_MS: u64 = 600;
 /// matter for a mostly-idle UI.
 const ANIMATION_TICK: Duration = Duration::from_millis(50);
 
-/// Window chrome bar height — brand + hotkey hints.
-pub const CHROME_BAR_HEIGHT: f32 = 28.0;
 /// Strip dimensions per spec §3 ("Card dimensions: ~140×48px").
 pub const STRIP_HEIGHT: f32 = 56.0;
 pub const CARD_WIDTH: f32 = 140.0;
@@ -105,47 +102,6 @@ pub struct TileDragGhost {
     pub label: String,
 }
 
-/// Tips the Kooka mascot might share.
-const KOOKA_TIPS: &[&str] = &[
-    "\u{2318}\u{21e7}T for a new workspace",
-    "drag a tile onto a card",
-    "\u{2318}Enter = zen mode",
-    "press Z to zen real quick",
-    "double-click a card to rename",
-    "HDAHAHA!",
-    "\u{2026}",
-    "watching claude work",
-];
-
-/// Kooka mascot moods.
-#[derive(Copy, Clone, Debug, PartialEq)]
-enum KookaMood {
-    Idle,
-    Watching,
-    Cheering,
-    Laugh,
-}
-
-/// Persistent state for the Kooka mascot bird.
-struct KookaState {
-    /// Position on screen (logical pixels, top-left of sprite).
-    x: f32,
-    y: f32,
-    /// -1 facing left, +1 facing right.
-    dir: f32,
-    mood: KookaMood,
-    /// Speech bubble text (None = silent).
-    phrase: Option<String>,
-    /// When the phrase appeared (egui time), so we can fade it.
-    phrase_started: f64,
-    /// When the last hop happened.
-    last_hop: f64,
-    /// When the last tip was shown.
-    last_tip: f64,
-    /// Hop counter for comedy beats.
-    hop_count: u32,
-}
-
 /// UI layer state. Holds the egui `Context` and the `egui_winit::State`
 /// adapter that converts `WindowEvent`s into egui input.
 pub struct UiLayer {
@@ -162,15 +118,18 @@ pub struct UiLayer {
     /// Ghost pill to paint following the cursor while a tile drag is
     /// active. Set by the app; cleared on drop.
     tile_drag_ghost: Option<TileDragGhost>,
-    /// The Kooka mascot bird.
-    kooka: KookaState,
-    /// Tile rects for Kooka hopping (logical pixels, from the app layer).
-    kooka_tile_rects: Vec<CoreRect>,
     /// Which workspace index is being "squish"-animated (koo-ws-squish)
     /// and when it started. Cleared after the animation (~340ms) elapses.
     squish: Option<(usize, f64)>,
     /// Last active workspace index, for detecting switches.
     last_ws_idx: usize,
+    /// Rect (logical pixels) of the central area left after the strip +
+    /// status bar panels render. Captured via `ctx.available_rect()` on
+    /// each frame so the app layer can size terminal tiles to exactly
+    /// the remaining space — `exact_height` on the panels doesn't account
+    /// for `inner_margin`, so using egui's own measurement avoids overlap.
+    /// `None` until the first frame has run.
+    central_rect: Option<egui::Rect>,
 }
 
 impl UiLayer {
@@ -199,37 +158,23 @@ impl UiLayer {
             reorder: None,
             card_rects: Vec::new(),
             tile_drag_ghost: None,
-            kooka: KookaState {
-                x: 200.0,
-                y: 120.0,
-                dir: 1.0,
-                mood: KookaMood::Idle,
-                phrase: None,
-                phrase_started: 0.0,
-                last_hop: 0.0,
-                last_tip: 0.0,
-                hop_count: 0,
-            },
-            kooka_tile_rects: Vec::new(),
             squish: None,
             last_ws_idx: 0,
+            central_rect: None,
         }
+    }
+
+    /// Logical-pixel rect of the area remaining after the strip and status
+    /// bar panels are laid out. Returns `None` before the first frame.
+    #[must_use]
+    pub fn central_rect(&self) -> Option<egui::Rect> {
+        self.central_rect
     }
 
     /// Called by the app each frame a tile drag is in flight. Pass `None`
     /// on drop / cancel to clear the ghost.
     pub fn set_tile_drag_ghost(&mut self, ghost: Option<TileDragGhost>) {
         self.tile_drag_ghost = ghost;
-    }
-
-    /// Update the Kooka's tile rects (logical pixels) so it can hop to
-    /// tile headers. Called by the app layer each frame with the computed
-    /// tile layout rects.
-    pub fn set_tile_rects_for_kooka(&mut self, rects: &[CoreRect]) {
-        self.kooka_tile_rects.clear();
-        for r in rects {
-            self.kooka_tile_rects.push(*r);
-        }
     }
 
     /// Forward a winit event to egui. Returns egui's response so the
@@ -317,8 +262,6 @@ impl UiLayer {
         let tile_drag_ghost = self.tile_drag_ghost.as_ref();
         let now = Instant::now();
         card_rects.clear();
-        let kooka = &mut self.kooka;
-        let kooka_rects = &self.kooka_tile_rects;
 
         // Detect workspace switch → trigger squish animation on the new card.
         let current_ws_idx = state.workspaces.iter().position(|ws| ws.id == state.active_workspace).unwrap_or(0);
@@ -337,7 +280,6 @@ impl UiLayer {
         let squish = &self.squish;
 
         let full_output = ctx.run(raw_input, |ctx| {
-            build_chrome_bar(ctx);
             build_strip(
                 ctx,
                 state,
@@ -350,12 +292,10 @@ impl UiLayer {
                 squish,
             );
             build_status_bar(ctx, state, now);
-            // Kooka mascot — tick + paint (only outside zen mode).
-            if !state.zen_mode {
-                tick_kooka(kooka, kooka_rects, state, ctx);
-                paint_kooka(ctx, kooka);
-            }
         });
+        // After the panels build themselves, `available_rect` is the
+        // central area that's left — what we should size terminals into.
+        self.central_rect = Some(ctx.available_rect());
         self.wants_keyboard = ctx.wants_keyboard_input();
         self.wants_pointer = ctx.wants_pointer_input();
         self.winit_state
@@ -368,94 +308,6 @@ impl UiLayer {
             pixels_per_point,
         }
     }
-}
-
-/// Build the window chrome bar — brand wordmark + global hotkey hints.
-/// Sits above the strip in the same position as the design's traffic-light bar.
-fn build_chrome_bar(ctx: &egui::Context) {
-    egui::TopBottomPanel::top("kookaburra-chrome-bar")
-        .exact_height(CHROME_BAR_HEIGHT)
-        .frame(
-            Frame::none()
-                .fill(BG_DEEP)
-                .stroke(Stroke::new(1.0, GRID_LINE))
-                .inner_margin(egui::Margin::symmetric(12.0, 0.0)),
-        )
-        .show(ctx, |ui| {
-            ui.horizontal_centered(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-
-                // Pixel-style "K" logo with koo-peck bob.
-                {
-                    let t = ui.ctx().input(|i| i.time);
-                    let peck_cycle = (t % 1.6) / 1.6;
-                    let peck_dy = if peck_cycle > 0.84 && peck_cycle < 0.87 {
-                        1.5
-                    } else if peck_cycle > 0.87 && peck_cycle < 0.91 {
-                        -0.5
-                    } else {
-                        0.0
-                    };
-                    let (logo_rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 18.0), Sense::hover());
-                    ui.painter().text(
-                        logo_rect.center() + Vec2::new(0.0, peck_dy as f32),
-                        egui::Align2::CENTER_CENTER,
-                        "K",
-                        FontId::monospace(16.0),
-                        ACCENT,
-                    );
-                }
-
-                // Brand wordmark — uppercase, letter-spaced, dimmer than
-                // normal text to stay decorative rather than functional.
-                ui.label(
-                    RichText::new("K O O K A B U R R A")
-                        .color(FG_DIM)
-                        .font(FontId::monospace(9.0)),
-                );
-
-                // Push right
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    // Hotkey hints
-                    chrome_chip(ui, "Z zen");
-                    chrome_chip(ui, "\u{2318}T tile");
-                    chrome_chip(ui, "\u{2318}N ws");
-                });
-            });
-        });
-}
-
-/// Paint subtle horizontal dither lines over a region (pixel.css effect).
-/// Every 3rd pixel gets a faint white line, creating a CRT-like dither.
-fn paint_dither_lines(painter: &egui::Painter, rect: egui::Rect) {
-    let dither = Color32::from_rgba_premultiplied(255, 255, 255, 5); // ~2% white
-    let mut y = rect.top();
-    while y < rect.bottom() {
-        painter.rect_filled(
-            egui::Rect::from_min_size(egui::pos2(rect.left(), y), Vec2::new(rect.width(), 1.0)),
-            Rounding::ZERO,
-            dither,
-        );
-        y += 3.0;
-    }
-}
-
-/// Small hotkey hint chip for the chrome bar.
-fn chrome_chip(ui: &mut egui::Ui, text: &str) {
-    let (rect, _) = ui.allocate_exact_size(
-        Vec2::new(text.len() as f32 * 5.5 + 10.0, 16.0),
-        Sense::hover(),
-    );
-    ui.painter().rect_filled(rect, Rounding::ZERO, BG_DIM);
-    ui.painter().rect_stroke(rect, Rounding::ZERO, Stroke::new(1.0, GRID_LINE));
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        text,
-        FontId::monospace(8.0),
-        FG_FAINT,
-    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -475,7 +327,7 @@ fn build_strip(
     // per frame regardless of how many cards are active.
     let mut any_animation = tile_drag_ghost.is_some();
 
-    let strip_resp = egui::TopBottomPanel::top("kookaburra-strip")
+    egui::TopBottomPanel::top("kookaburra-strip")
         .exact_height(STRIP_HEIGHT)
         .frame(
             Frame::none()
@@ -522,9 +374,6 @@ fn build_strip(
             });
         });
 
-    // Dither overlay on the strip (pixel.css .koo-strip dither).
-    paint_dither_lines(&ctx.layer_painter(egui::LayerId::background()), strip_resp.response.rect);
-
     // Workspace vanished (e.g. deleted via middle-click while mid-rename)?
     // Drop the stale editor.
     if let Some(r) = renaming.as_ref() {
@@ -540,13 +389,6 @@ fn build_strip(
     // both the strip and the tile area beneath.
     if let Some(ghost) = tile_drag_ghost {
         paint_tile_drag_ghost(ctx, ghost);
-    }
-
-    // Decorative walker bird — a tiny "K" that hops slowly across the
-    // grid area, like the design's WalkerBird. Low opacity so it stays
-    // whimsical rather than distracting.
-    if !state.zen_mode {
-        paint_walker_bird(ctx, now);
     }
 
     if any_animation {
@@ -1028,303 +870,6 @@ fn paint_tile_drag_ghost(ctx: &egui::Context, ghost: &TileDragGhost) {
         FontId::proportional(12.0),
         FG,
     );
-}
-
-/// Decorative walker bird — a tiny amber "K" that hops rightward across
-/// the tile grid area every few seconds, cycling back to the left edge.
-/// Matches the design's WalkerBird component (14px, opacity 0.35).
-/// Includes koo-walk animation (1px jitter on hop phase).
-fn paint_walker_bird(ctx: &egui::Context, _now: Instant) {
-    let t = ctx.input(|i| i.time);
-    // Hop every 2 seconds, moving 32px per hop, cycling across 1200px.
-    let hop_x = (((t / 2.0) as u64 * 32) % 1200) as f32;
-    // Smooth cubic easing between hops for the last 1.5s of the 2s cycle.
-    let frac = (t % 2.0) / 2.0;
-    let ease = if frac < 0.75 {
-        // Resting phase
-        0.0
-    } else {
-        let p = (frac - 0.75) / 0.25;
-        p as f32 * p as f32 * (3.0 - 2.0 * p as f32) // smoothstep
-    };
-    let x = 40.0 + hop_x + ease * 32.0;
-    // koo-walk: subtle 1px shifts during hop (translateX(1px) translateY(-1px)).
-    let walk_phase = (t % 0.7) / 0.7;
-    let (walk_x, walk_y) = if walk_phase > 0.4 && walk_phase < 0.6 {
-        (1.0, -1.0)
-    } else {
-        (0.0, 0.0)
-    };
-    // Vertical bob: 1px up at mid-hop.
-    let bob_y = if ease > 0.2 && ease < 0.8 { -1.0 } else { 0.0 };
-    let y = (CHROME_BAR_HEIGHT + STRIP_HEIGHT + 80.0) + bob_y + walk_y;
-
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Foreground,
-        egui::Id::new("kookaburra-walker-bird"),
-    ));
-    // Draw a tiny trail: 3 fading "footprints" behind the bird.
-    for step in 1..=3 {
-        let trail_alpha = 0.08 / step as f32;
-        let trail_x = x + walk_x - (step as f32 * 14.0);
-        if trail_x > 0.0 {
-            painter.text(
-                egui::pos2(trail_x, y + 2.0),
-                egui::Align2::CENTER_CENTER,
-                "·",
-                FontId::monospace(8.0),
-                ACCENT.gamma_multiply(trail_alpha),
-            );
-        }
-    }
-    painter.text(
-        egui::pos2(x + walk_x, y),
-        egui::Align2::CENTER_CENTER,
-        "K",
-        FontId::monospace(12.0),
-        ACCENT.gamma_multiply(0.3),
-    );
-}
-
-/// Tick the Kooka mascot's state: decide whether to hop, pick a target,
-/// fire speech bubbles, update mood.
-fn tick_kooka(
-    kooka: &mut KookaState,
-    tile_rects: &[CoreRect],
-    state: &AppState,
-    ctx: &egui::Context,
-) {
-    let t = ctx.input(|i| i.time);
-
-    // Clear expired phrases (visible for 2.4 seconds).
-    if kooka.phrase.is_some() && t - kooka.phrase_started > 2.4 {
-        kooka.phrase = None;
-    }
-
-    // Check if any tiles are generating.
-    let active_ws = state.workspace(state.active_workspace);
-    let generating_count = active_ws
-        .map(|ws| {
-            ws.tiles
-                .iter()
-                .filter(|tile| {
-                    tile.last_output_at
-                        .map(|at| Instant::now().saturating_duration_since(at)
-                            < Duration::from_millis(GENERATING_LATENCY_MS))
-                        .unwrap_or(false)
-                })
-                .count()
-        })
-        .unwrap_or(0);
-
-    // Update mood based on generating state.
-    if generating_count > 0 && kooka.mood == KookaMood::Idle {
-        kooka.mood = KookaMood::Watching;
-    } else if generating_count == 0 && kooka.mood == KookaMood::Watching {
-        kooka.mood = KookaMood::Cheering;
-        kooka.phrase = Some("all done!".to_string());
-        kooka.phrase_started = t;
-        // Cheering reverts to idle after 1.8s.
-    }
-    if kooka.mood == KookaMood::Cheering && t - kooka.phrase_started > 1.8 {
-        kooka.mood = KookaMood::Idle;
-    }
-
-    // Hop every ~4 seconds to a random tile header perch.
-    let hop_interval = 4.2;
-    if t - kooka.last_hop > hop_interval && !tile_rects.is_empty() {
-        // Pick a target tile. Prefer generating tiles 50% of the time,
-        // else random.
-        let target_idx = if generating_count > 0 && ((t * 1000.0) as u32 % 2 == 0) {
-            // Find a generating tile index.
-            active_ws
-                .and_then(|ws| {
-                    ws.tiles.iter().position(|tile| {
-                        tile.last_output_at
-                            .map(|at| Instant::now().saturating_duration_since(at)
-                                < Duration::from_millis(GENERATING_LATENCY_MS))
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(0)
-        } else {
-            ((t * 7.0) as usize) % tile_rects.len()
-        };
-
-        if let Some(rect) = tile_rects.get(target_idx) {
-            // Perch: random x along top of tile, y just above tile header.
-            let margin = 20.0;
-            let w = rect.width;
-            let jitter = ((t * 137.0).sin().abs() as f32) * (w - margin * 2.0 - 32.0).max(0.0);
-            let new_x = rect.x + margin + jitter;
-            let new_y = rect.y - 32.0 - 6.0; // 32px sprite + 6px perch offset
-            kooka.dir = if new_x > kooka.x { 1.0 } else { -1.0 };
-            kooka.x = new_x;
-            kooka.y = new_y;
-            kooka.last_hop = t;
-            kooka.hop_count += 1;
-        }
-    }
-
-    // Every 5th hop triggers a laugh (HDAHAHAHAHA!).
-    if kooka.hop_count > 0 && kooka.hop_count % 5 == 0
-        && kooka.mood != KookaMood::Laugh
-        && t - kooka.last_hop < 0.1
-    {
-        kooka.mood = KookaMood::Laugh;
-        kooka.phrase = Some("HDAHAHAHAHA!".to_string());
-        kooka.phrase_started = t;
-    }
-    if kooka.mood == KookaMood::Laugh && t - kooka.phrase_started > 2.0 {
-        kooka.mood = KookaMood::Idle;
-    }
-
-    // Periodic tips: every ~8 seconds, 30% chance.
-    if t - kooka.last_tip > 8.0 && kooka.phrase.is_none() {
-        let roll = ((t * 31.0).sin().abs() as f32) < 0.3;
-        if roll {
-            let idx = ((t * 73.0) as usize) % KOOKA_TIPS.len();
-            kooka.phrase = Some(KOOKA_TIPS[idx].to_string());
-            kooka.phrase_started = t;
-            kooka.last_tip = t;
-        }
-    }
-}
-
-/// Paint the Kooka mascot as an egui overlay. The bird is rendered as a
-/// large amber "K" with mood-based animations, plus an optional speech
-/// bubble.
-fn paint_kooka(ctx: &egui::Context, kooka: &KookaState) {
-    let t = ctx.input(|i| i.time);
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Foreground,
-        egui::Id::new("kookaburra-kooka-mascot"),
-    ));
-
-    let sprite_size = 32.0;
-
-    // Idle bob: gentle 1px sine bounce (koo-idle-bob).
-    let bob = if kooka.mood == KookaMood::Idle {
-        -1.0 * ((t * std::f64::consts::TAU / 2.2).sin() as f32)
-    } else {
-        0.0
-    };
-
-    // Cheering bounce: bigger, faster (koo-kooka-cheer).
-    let cheer_y = if kooka.mood == KookaMood::Cheering {
-        -3.0 * ((t * std::f64::consts::TAU / 0.5).sin() as f32)
-    } else {
-        0.0
-    };
-
-    // Watching tilt: subtle rotation approximated as x-offset oscillation.
-    let watch_x = if kooka.mood == KookaMood::Watching {
-        -2.0 * ((t * std::f64::consts::TAU / 1.8).sin() as f32)
-    } else {
-        0.0
-    };
-
-    // Laugh: bouncy jitter (koo-kooka-laugh: translateY(-2px) scaleY(0.92)).
-    let laugh_y = if kooka.mood == KookaMood::Laugh {
-        -2.0 * ((t * std::f64::consts::TAU / 0.3).sin() as f32).abs()
-    } else {
-        0.0
-    };
-
-    let bx = kooka.x + watch_x;
-    let by = kooka.y + bob + cheer_y + laugh_y;
-
-    // Shadow under bird.
-    let shadow_rect = egui::Rect::from_min_size(
-        egui::pos2(bx + sprite_size / 2.0 - 8.0, by + sprite_size + 4.0),
-        Vec2::new(16.0, 3.0),
-    );
-    painter.rect_filled(shadow_rect, Rounding::ZERO, Color32::from_rgba_premultiplied(5, 5, 5, 80));
-
-    // Bird sprite: a chunky amber "K" with glow.
-    let bird_center = egui::pos2(bx + sprite_size / 2.0, by + sprite_size / 2.0);
-    // Flip direction: we can't truly flip text, so we add an indicator.
-    let dir_char = if kooka.dir > 0.0 { "K>" } else { "<K" };
-    // Glow halo behind the bird (design: `filter: drop-shadow(0 0 2px accent/40%)`)
-    painter.text(
-        bird_center + Vec2::new(0.0, 1.0),
-        egui::Align2::CENTER_CENTER,
-        dir_char,
-        FontId::monospace(22.0),
-        ACCENT.gamma_multiply(0.15),
-    );
-    painter.text(
-        bird_center,
-        egui::Align2::CENTER_CENTER,
-        dir_char,
-        FontId::monospace(20.0),
-        ACCENT,
-    );
-
-    // Eye blink: a tiny dark square that appears briefly (koo-kooka-blink).
-    let blink_cycle = (t * 0.33) % 1.0; // ~3s cycle
-    if blink_cycle > 0.92 && blink_cycle < 0.97 {
-        let eye_pos = egui::pos2(
-            bx + sprite_size * 0.62,
-            by + sprite_size * 0.28,
-        );
-        painter.rect_filled(
-            egui::Rect::from_min_size(eye_pos, Vec2::splat(3.0)),
-            Rounding::ZERO,
-            BG_DEEP,
-        );
-    }
-
-    // Speech bubble.
-    if let Some(phrase) = &kooka.phrase {
-        let age = (t - kooka.phrase_started).min(2.4);
-        // Entrance animation: slide up + fade in during first 180ms.
-        let entrance = (age / 0.18).min(1.0) as f32;
-        let fade_out = if age > 2.0 { 1.0 - ((age - 2.0) / 0.4) as f32 } else { 1.0 };
-        let alpha = (entrance * fade_out).clamp(0.0, 1.0);
-
-        if alpha > 0.01 {
-            let slide_y = (1.0 - entrance) * 4.0;
-            let bubble_x = if kooka.dir > 0.0 {
-                bx + sprite_size + 6.0
-            } else {
-                bx - 170.0
-            };
-            let bubble_y = by - 22.0 + slide_y;
-            let bubble_w = (phrase.len() as f32 * 6.5 + 16.0).clamp(80.0, 220.0);
-            let bubble_rect = egui::Rect::from_min_size(
-                egui::pos2(bubble_x, bubble_y),
-                Vec2::new(bubble_w, 22.0),
-            );
-            painter.rect(
-                bubble_rect,
-                Rounding::ZERO,
-                BG_DEEP.gamma_multiply(alpha),
-                Stroke::new(2.0, ACCENT.gamma_multiply(alpha)),
-            );
-            painter.text(
-                bubble_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                phrase,
-                FontId::monospace(10.0),
-                FG.gamma_multiply(alpha),
-            );
-            // Pixel tail: small square pointing toward the bird.
-            let tail_x = if kooka.dir > 0.0 {
-                bubble_rect.left() - 4.0
-            } else {
-                bubble_rect.right()
-            };
-            painter.rect_filled(
-                egui::Rect::from_min_size(
-                    egui::pos2(tail_x, bubble_rect.bottom() - 8.0),
-                    Vec2::splat(4.0),
-                ),
-                Rounding::ZERO,
-                ACCENT.gamma_multiply(alpha),
-            );
-        }
-    }
 }
 
 /// Strip search-box placeholder — the design has "⌕ search all tiles… ⌘⇧F"

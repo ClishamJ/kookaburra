@@ -317,57 +317,6 @@ impl Renderer {
             }
         }
 
-        // --- CRT scanline overlay ---
-        // Semi-transparent black lines every 3rd pixel row across the
-        // visible surface. A moving brightness wave simulates CRT refresh.
-        let surf_w = self.surface_config.width as f32;
-        let surf_h = self.surface_config.height as f32;
-        {
-            // CRT refresh wave: a bright band that scrolls downward at
-            // ~120px/sec (wraps around the screen height).
-            let wave_y = ((t_secs * 120.0) % surf_h as f64) as f32;
-            let wave_half = 60.0_f32; // half-width of the bright band
-            let mut y = 0.0_f32;
-            while y < surf_h {
-                // Distance from the wave center → modulate alpha.
-                let dist = (y - wave_y).abs().min(surf_h - (y - wave_y).abs());
-                let wave_factor = if dist < wave_half {
-                    1.0 - dist / wave_half
-                } else {
-                    0.0
-                };
-                // Base alpha ~7%, wave reduces it by up to 40% (brighter band).
-                let alpha = (18.0 - 7.0 * wave_factor).max(0.0) as u8;
-                let scanline_color = Rgba { r: 0, g: 0, b: 0, a: alpha };
-                self.pipeline.push_bg(0.0, y, surf_w, 1.0, scanline_color);
-                y += 3.0;
-            }
-        }
-
-        // --- Vignette ---
-        // Darken edges with a stepped radial approximation: four border
-        // strips with increasing opacity toward the edges.
-        {
-            let vignette_steps: &[(f32, u8)] = &[
-                (0.08, 8),   // outer 8% of each edge, alpha 8
-                (0.05, 16),  // outer 5%, alpha 16
-                (0.025, 28), // outer 2.5%, alpha 28
-            ];
-            for &(frac, alpha) in vignette_steps {
-                let v = Rgba { r: 0, g: 0, b: 0, a: alpha };
-                let dx = surf_w * frac;
-                let dy = surf_h * frac;
-                // Left
-                self.pipeline.push_bg(0.0, 0.0, dx, surf_h, v);
-                // Right
-                self.pipeline.push_bg(surf_w - dx, 0.0, dx, surf_h, v);
-                // Top
-                self.pipeline.push_bg(0.0, 0.0, surf_w, dy, v);
-                // Bottom
-                self.pipeline.push_bg(0.0, surf_h - dy, surf_w, dy, v);
-            }
-        }
-
         let clear = rgba_to_wgpu_color(self.theme.background);
         let mut encoder = self
             .device
@@ -685,19 +634,6 @@ impl Renderer {
 
         // Offset cell grid below the header bar + separator.
         let content_y = rect.y + header_h + 1.0;
-
-        // --- dithered background pattern ---
-        // Subtle horizontal lines every 4px across the tile content area,
-        // mirroring pixel.css's `repeating-linear-gradient` dither.
-        {
-            let dither = Rgba { r: 255, g: 255, b: 255, a: 4 }; // ~1.5% white
-            let content_h = tile_h - header_h - 1.0;
-            let mut dy = 0.0_f32;
-            while dy < content_h {
-                pipeline.push_bg(rect.x, content_y + dy, tile_w, 2.0, dither);
-                dy += 4.0;
-            }
-        }
 
         // --- koo-glitch: occasional horizontal offset on a few rows ---
         // Triggers for ~200ms every ~10 seconds. During the glitch window,

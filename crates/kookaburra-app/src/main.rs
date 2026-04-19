@@ -19,7 +19,7 @@ use kookaburra_core::worktree::WorktreeConfig;
 
 use kookaburra_pty::{PtyEvent, PtyEventSink, PtyManager, SpawnRequest};
 use kookaburra_render::{cells_in_rect, RenderTile, Renderer, UiFrame};
-use kookaburra_ui::{EventResponse, PreparedFrame, TileDragGhost, UiLayer, CHROME_BAR_HEIGHT, STRIP_HEIGHT, STATUS_BAR_HEIGHT};
+use kookaburra_ui::{EventResponse, PreparedFrame, TileDragGhost, UiLayer, STRIP_HEIGHT, STATUS_BAR_HEIGHT};
 
 use portable_pty::PtySize;
 use winit::application::ApplicationHandler;
@@ -166,28 +166,43 @@ impl App {
         self.state.tile(tile_id).map(|t| t.pty_id)
     }
 
-    /// Compute the layout of tile rects inside the current window, using
-    /// the active workspace's layout. Reserves the top `STRIP_HEIGHT`
-    /// pixels (in logical coords) for the egui strip.
-    fn tile_rects(&self, layout: Layout) -> Vec<Rect> {
-        let Some(renderer) = self.renderer.as_ref() else {
-            return Vec::new();
-        };
-        let (win_w, win_h) = renderer.size();
+    /// Physical-pixel rect of the area tiles can occupy this frame.
+    /// Prefers egui's measured central rect (what's left after the strip
+    /// and status bar panels lay out — this accounts for panel margins,
+    /// which a manual `STRIP_HEIGHT` reservation misses). Falls back to
+    /// the constants before the first UI frame, or when no renderer is
+    /// attached yet.
+    fn available_area(&self) -> Option<Rect> {
+        let renderer = self.renderer.as_ref()?;
         let scale = self
             .window
             .as_ref()
             .map(|w| w.scale_factor() as f32)
             .unwrap_or(1.0);
-        let chrome_px = CHROME_BAR_HEIGHT * scale;
+        if let Some(c) = self.ui.as_ref().and_then(|u| u.central_rect()) {
+            return Some(Rect {
+                x: c.left() * scale + WINDOW_INSET_PX,
+                y: c.top() * scale + WINDOW_INSET_PX,
+                width: (c.width() * scale - 2.0 * WINDOW_INSET_PX).max(1.0),
+                height: (c.height() * scale - 2.0 * WINDOW_INSET_PX).max(1.0),
+            });
+        }
+        let (win_w, win_h) = renderer.size();
         let strip_px = STRIP_HEIGHT * scale;
         let status_bar_px = STATUS_BAR_HEIGHT * scale;
-        let top_px = chrome_px + strip_px;
-        let area = Rect {
+        Some(Rect {
             x: WINDOW_INSET_PX,
-            y: top_px + WINDOW_INSET_PX,
+            y: strip_px + WINDOW_INSET_PX,
             width: (win_w as f32 - 2.0 * WINDOW_INSET_PX).max(1.0),
-            height: (win_h as f32 - top_px - status_bar_px - 2.0 * WINDOW_INSET_PX).max(1.0),
+            height: (win_h as f32 - strip_px - status_bar_px - 2.0 * WINDOW_INSET_PX).max(1.0),
+        })
+    }
+
+    /// Compute the layout of tile rects inside the current window, using
+    /// the active workspace's layout.
+    fn tile_rects(&self, layout: Layout) -> Vec<Rect> {
+        let Some(area) = self.available_area() else {
+            return Vec::new();
         };
         let mut rects = compute_tile_rects(layout, area);
         // Shrink each rect by the gap so neighboring tiles are visibly
@@ -372,25 +387,12 @@ impl App {
     }
 
     fn render_if_needed(&mut self, ui_frame: Option<PreparedFrame>) {
-        let Some(renderer) = self.renderer.as_mut() else {
+        let Some(area) = self.available_area() else {
             return;
         };
-        let (win_w, win_h) = renderer.size();
-        let scale = self
-            .window
-            .as_ref()
-            .map(|w| w.scale_factor() as f32)
-            .unwrap_or(1.0);
-        let chrome_px = CHROME_BAR_HEIGHT * scale;
-        let strip_px = STRIP_HEIGHT * scale;
-        let status_bar_px = STATUS_BAR_HEIGHT * scale;
-        let top_px = chrome_px + strip_px;
-        let area = Rect {
-            x: WINDOW_INSET_PX,
-            y: top_px + WINDOW_INSET_PX,
-            width: (win_w as f32 - 2.0 * WINDOW_INSET_PX).max(1.0),
-            height: (win_h as f32 - top_px - status_bar_px - 2.0 * WINDOW_INSET_PX).max(1.0),
-        };
+        if self.renderer.is_none() {
+            return;
+        }
         self.render_scratch.clear();
         let theme = self.config.theme.clone();
         let focused = self.state.focused_tile;
@@ -493,7 +495,9 @@ impl App {
             textures_delta: p.textures_delta,
             pixels_per_point: p.pixels_per_point,
         });
-        renderer.render_frame(&self.render_scratch, ui_frame.as_ref());
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.render_frame(&self.render_scratch, ui_frame.as_ref());
+        }
         self.last_frame = Instant::now();
         self.last_rendered_focus = focused;
         self.dirty_tiles.clear();
@@ -587,8 +591,13 @@ impl App {
             }
             return;
         }
-        // Dropped inside the strip area (chrome + strip) but not on a card → spin out.
-        let top_area = CHROME_BAR_HEIGHT + STRIP_HEIGHT;
+        // Dropped inside the strip area but not on a card → spin out.
+        // Use egui's measured central rect so the hit zone matches the
+        // actual strip (including its margin), not just the nominal height.
+        let top_area = ui
+            .central_rect()
+            .map(|c| c.top())
+            .unwrap_or(STRIP_HEIGHT);
         if (0.0..=top_area).contains(&logical_y) {
             self.actions
                 .push(Action::MoveTileToNewWorkspace { tile_id });
@@ -729,13 +738,6 @@ impl App {
         });
         let ui = self.ui.as_mut()?;
         ui.set_tile_drag_ghost(ghost);
-        // Feed the Kooka mascot with current tile rects so it can hop
-        // between tile headers.
-        let kooka_rects = {
-            let layout = self.state.active_workspace().layout;
-            self.tile_rects(layout)
-        };
-        ui.set_tile_rects_for_kooka(&kooka_rects);
         Some(ui.run_frame(&window, &self.state, &mut self.actions))
     }
 
