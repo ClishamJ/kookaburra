@@ -1072,10 +1072,13 @@ fn key_event_to_bytes(ev: &KeyEvent, mods: ModifiersState) -> Option<Vec<u8>> {
     None
 }
 
-fn named_key_bytes(key: NamedKey, _mods: ModifiersState) -> &'static [u8] {
+fn named_key_bytes(key: NamedKey, mods: ModifiersState) -> &'static [u8] {
     match key {
         NamedKey::Enter => b"\r",
         NamedKey::Backspace => b"\x7f",
+        // xterm backtab (CSI Z) — Claude Code CLI uses Shift+Tab to cycle
+        // modes (auto/plan/etc); a bare \t would be interpreted as indent.
+        NamedKey::Tab if mods.shift_key() => b"\x1b[Z",
         NamedKey::Tab => b"\t",
         NamedKey::Escape => b"\x1b",
         NamedKey::Space => b" ",
