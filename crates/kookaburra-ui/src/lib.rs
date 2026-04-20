@@ -8,9 +8,12 @@
 //!
 //! **Event routing.** `on_window_event` returns an
 //! [`egui_winit::EventResponse`]; the main loop should skip terminal
-//! input when `consumed == true` AND the focus is actually on egui —
-//! egui tries hard not to eat raw keystrokes when no text widget wants
-//! them, but hover / click events over the strip do get consumed.
+//! input when `consumed == true` AND the focus is actually on egui.
+//! `wants_keyboard` is deliberately narrower than `ctx.wants_keyboard_input()`
+//! — that method returns true whenever *any* focused widget exists, so a
+//! stray focus left on a card after a click would swallow Shift+Tab (which
+//! Claude Code needs to cycle modes). We only claim the keyboard while the
+//! rename `TextEdit` is actually in the UI.
 
 use std::time::{Duration, Instant};
 
@@ -246,7 +249,11 @@ impl UiLayer {
             .map(|(id, _)| *id)
     }
 
-    /// Whether an egui text widget currently wants keyboard focus.
+    /// Whether an egui text widget currently wants keyboard focus. Only
+    /// the inline workspace-rename `TextEdit` qualifies — cards and
+    /// buttons do not, even if egui has stashed focus on one, so
+    /// Shift+Tab (Claude Code mode cycle) always reaches the focused
+    /// tile's PTY unless the user is actively renaming a workspace.
     #[must_use]
     pub fn wants_keyboard(&self) -> bool {
         self.wants_keyboard
@@ -347,7 +354,11 @@ impl UiLayer {
             }
         });
         self.central_rect = central;
-        self.wants_keyboard = ctx.wants_keyboard_input();
+        // `ctx.wants_keyboard_input()` flips true whenever any widget has
+        // focus — clicking a card can leave a stray focus that then
+        // swallows Shift+Tab, Enter, etc. The only legitimate text input
+        // in our UI is the rename editor, so gate strictly on that.
+        self.wants_keyboard = self.renaming.is_some();
         self.wants_pointer = ctx.wants_pointer_input();
         self.winit_state
             .handle_platform_output(window, full_output.platform_output);
