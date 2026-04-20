@@ -5,6 +5,8 @@
 //! renderer → PTY → `Term`. Strip, workspaces, drag-to-move and proper
 //! focus indicators come in later phases.
 
+mod particles;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -150,6 +152,10 @@ struct App {
     /// Plain left-press on a tile, waiting to find out whether the user
     /// means to focus (quick release) or drag (cursor moves far enough).
     press_pending: Option<PressPending>,
+    /// Live click-feedback particle bursts. Drained each frame: live
+    /// bursts contribute `RenderParticle`s to their tile and trigger a
+    /// redraw request; expired bursts are dropped. See `particles.rs`.
+    click_particles: Vec<particles::ParticleBurst>,
     clipboard: Option<arboard::Clipboard>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -181,6 +187,7 @@ impl App {
             cursor_pos: PhysicalPosition::new(0.0, 0.0),
             dragging_tile: None,
             press_pending: None,
+            click_particles: Vec::new(),
             // `arboard::Clipboard::new()` can fail in headless environments
             // (e.g. CI without a display). Degrade to "no paste support"
             // rather than panicking the app.
@@ -470,6 +477,17 @@ impl App {
         let theme = self.state.effective_theme(self.state.active_workspace);
         let focused = self.state.focused_tile;
 
+        // Age + cull click-particle bursts. Any survivor keeps the redraw
+        // cycle warm so the fade animates without waiting on input.
+        let particle_now = Instant::now();
+        self.click_particles.retain(|b| b.is_live(particle_now));
+        if !self.click_particles.is_empty() {
+            self.state.request_redraw();
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+
         // When focus changes the previously-focused and newly-focused
         // tiles both need a reshape (the dim/bright color mix is baked
         // into the glyphon buffer). Mark them dirty so the per-tile
@@ -517,6 +535,7 @@ impl App {
                     self.state.request_redraw();
                 }
                 let is_primary = self.state.active_workspace().primary_tile == Some(tile.id);
+                let tile_particles = self.collect_tile_particles(tile.id, particle_now);
                 self.render_scratch.push(RenderTile {
                     tile_id: tile.id,
                     rect: area,
@@ -527,6 +546,7 @@ impl App {
                     tile_index: 1,
                     update,
                     bell_flash,
+                    particles: tile_particles,
                 });
             }
         } else {
@@ -593,6 +613,7 @@ impl App {
                 } else {
                     None
                 };
+                let tile_particles = self.collect_tile_particles(*tile_id, particle_now);
                 self.render_scratch.push(RenderTile {
                     tile_id: *tile_id,
                     rect: tile_rect,
@@ -603,6 +624,7 @@ impl App {
                     tile_index: i + 1,
                     update,
                     bell_flash: *tile_bell,
+                    particles: tile_particles,
                 });
             }
         }
@@ -619,6 +641,60 @@ impl App {
         self.last_rendered_focus = focused;
         self.dirty_tiles.clear();
         self.state.mark_redrawn();
+    }
+
+    /// Evaluate every live burst on `tile_id` at `now` and flatten into a
+    /// single `Vec<RenderParticle>` to hand to the renderer. Called once
+    /// per tile per frame — in the common case (no recent click) every
+    /// retained `click_particles` entry belongs to a different tile or
+    /// there are none, so this returns an empty vec with no allocation.
+    fn collect_tile_particles(
+        &self,
+        tile_id: TileId,
+        now: Instant,
+    ) -> Vec<kookaburra_render::RenderParticle> {
+        if self.click_particles.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for b in &self.click_particles {
+            if b.tile_id == tile_id {
+                out.extend(particles::evaluate(b, now));
+            }
+        }
+        out
+    }
+
+    /// Queue a subtle particle burst at the click location on `tile_id`.
+    /// `phys_pos` is winit's physical-pixel cursor position; we convert
+    /// to tile-local logical pixels by finding the tile's rect and
+    /// dividing out the scale factor.
+    fn spawn_click_particles(&mut self, tile_id: TileId, phys_pos: PhysicalPosition<f64>) {
+        // Only spawn for real, on-screen tiles. Zen mode also qualifies —
+        // we just need a rect to subtract from.
+        let layout = self.state.active_workspace().layout;
+        let rects = self.tile_rects(layout);
+        let idx = self
+            .state
+            .active_workspace()
+            .tiles
+            .iter()
+            .position(|t| t.id == tile_id);
+        let Some(idx) = idx else {
+            return;
+        };
+        let Some(rect) = rects.get(idx).copied() else {
+            return;
+        };
+        let local_x = phys_pos.x as f32 - rect.x;
+        let local_y = phys_pos.y as f32 - rect.y;
+        let burst = particles::ParticleBurst::new(tile_id, (local_x, local_y), Instant::now());
+        self.click_particles.push(burst);
+        // A burst needs the redraw cycle to keep firing until it fades.
+        self.state.request_redraw();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
     }
 
     /// Walk the layout and return the tile whose rect contains (x, y).
@@ -742,8 +818,10 @@ impl App {
 
         // Prefix+digit: focus N-th tile. Checked first because it includes
         // Alt, so it never ambiguates with the Cmd-only prefix below.
+        // `!ev.repeat` so a held chord fires once, not on every OS repeat.
         if let Some(d) = digit {
             if d >= 1
+                && !ev.repeat
                 && self
                     .keybindings
                     .focus_tile_prefix
@@ -751,6 +829,7 @@ impl App {
             {
                 let idx = (d as usize) - 1;
                 if let Some(tile) = self.state.active_workspace().tiles.get(idx) {
+                    log::debug!("focus_tile shortcut: digit={d} mods={event_mods:?}");
                     self.actions.push(Action::FocusTile(tile.id));
                     return true;
                 }
@@ -826,6 +905,7 @@ impl App {
         // Cmd+<char> binding above wins over Cmd+<digit> fall-through.
         if let Some(d) = digit {
             if d >= 1
+                && !ev.repeat
                 && self
                     .keybindings
                     .switch_workspace_prefix
@@ -833,6 +913,7 @@ impl App {
             {
                 let idx = (d as usize) - 1;
                 if let Some(ws) = self.state.workspaces.get(idx) {
+                    log::debug!("switch_workspace shortcut: digit={d} mods={event_mods:?}");
                     self.actions.push(Action::SwitchWorkspace(ws.id));
                     return true;
                 }
@@ -1074,6 +1155,19 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::ModifiersChanged(new_mods) => {
                 self.modifiers = new_mods.state();
             }
+            WindowEvent::Focused(_) => {
+                // macOS routinely drops modifier-up events when focus
+                // leaves mid-chord (Cmd+Tab, Mission Control, system
+                // shortcuts). Without this reset, a stale `Cmd` flag
+                // makes the next digit the user types fire `Cmd+digit`
+                // → SwitchWorkspace, "throwing" them to a random
+                // workspace while typing. Reset on both gain and loss
+                // since we can't trust either edge to deliver fresh
+                // ModifiersChanged.
+                self.modifiers = ModifiersState::empty();
+                self.press_pending = None;
+                self.dragging_tile = None;
+            }
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if self.handle_app_shortcut(&key) {
                     return;
@@ -1145,6 +1239,7 @@ impl ApplicationHandler<AppEvent> for App {
             } => {
                 if let Some(p) = self.press_pending.take() {
                     self.actions.push(Action::FocusTile(p.tile_id));
+                    self.spawn_click_particles(p.tile_id, self.cursor_pos);
                 } else {
                     self.end_tile_drag();
                 }

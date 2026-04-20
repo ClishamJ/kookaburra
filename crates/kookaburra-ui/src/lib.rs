@@ -15,9 +15,10 @@
 //! Claude Code needs to cycle modes). We only claim the keyboard while the
 //! rename `TextEdit` is actually in the UI.
 
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use egui::{Button, Color32, FontId, Frame, RichText, Rounding, Sense, Stroke, Vec2};
+use egui::{Button, Color32, FontId, Frame, Rect, RichText, Rounding, Sense, Stroke, Vec2};
 pub use egui_winit::EventResponse;
 use winit::event::WindowEvent;
 use winit::window::Window;
@@ -47,6 +48,15 @@ const GENERATING_LATENCY_MS: u64 = 600;
 /// breathing alpha / moving dots / drag ghosts read smoothly. Still
 /// coalesced by egui, so an idle UI with no animations doesn't repaint.
 const ANIMATION_TICK: Duration = Duration::from_millis(16);
+
+/// Total duration of the workspace-switch "squish" settle, in seconds.
+/// Short and smooth — the card eases from a slight press-in (0.92×) up to
+/// rest (1.0×) with a cubic ease-out. No overshoot in either axis so the
+/// card never grows past its resting footprint, which keeps the bottom
+/// accent bar from sliding into the tile area below and making the
+/// terminal grid appear to bounce.
+const SQUISH_DURATION: f64 = 0.28;
+const SQUISH_START_SCALE: f32 = 0.92;
 
 /// Strip dimensions per spec §3 ("Card dimensions: ~140×48px").
 pub const STRIP_HEIGHT: f32 = 56.0;
@@ -325,10 +335,10 @@ impl UiLayer {
             self.squish = Some((current_ws_idx, t));
             self.last_ws_idx = current_ws_idx;
         }
-        // Expire squish after 340ms.
+        // Expire squish after SQUISH_DURATION.
         if let Some((_, started)) = self.squish {
             let t = ctx.input(|i| i.time);
-            if t - started > 0.34 {
+            if t - started > SQUISH_DURATION {
                 self.squish = None;
             }
         }
@@ -506,7 +516,14 @@ fn draw_workspace_slot(
     let signals = workspace_signals(ws, now);
     let show_activity_dot = !active && signals.dirty && !signals.generating;
     let dragging_this = reorder.as_ref().is_some_and(|r| r.source_idx == idx);
-    let is_squishing = squish.map(|(si, _)| si == idx).unwrap_or(false);
+    let time_secs = ui.ctx().input(|i| i.time);
+    let squish_elapsed = squish.and_then(|(si, started)| {
+        if si == idx {
+            Some((time_secs - started).clamp(0.0, SQUISH_DURATION) as f32)
+        } else {
+            None
+        }
+    });
     let resp = draw_card(
         ui,
         &ws.label,
@@ -518,8 +535,8 @@ fn draw_workspace_slot(
         show_activity_dot,
         signals.generating,
         dragging_this,
-        is_squishing,
-        ui.ctx().input(|i| i.time),
+        squish_elapsed,
+        time_secs,
     );
     // Drag start: plain left-drag on a card. Use this to reorder, not
     // to switch.
@@ -546,7 +563,7 @@ fn draw_workspace_slot(
             focus_requested: false,
         });
     }
-    let animating = show_activity_dot || signals.generating || is_squishing;
+    let animating = show_activity_dot || signals.generating || squish_elapsed.is_some();
     (resp.rect, animating)
 }
 
@@ -604,8 +621,71 @@ fn draw_rename_editor(
     rect
 }
 
+/// Parsed pixel-art kookaburra logo. Each tuple is an `(x, y)` cell on the
+/// 8px SVG grid, normalized to the content bounding box (so `(0, 0)` is the
+/// top-left of the bird itself, not the 320×320 canvas).
+struct LogoPixels {
+    cells: Vec<(u8, u8)>,
+    width: u8,
+    height: u8,
+}
+
+fn logo_pixels() -> &'static LogoPixels {
+    static PIXELS: OnceLock<LogoPixels> = OnceLock::new();
+    PIXELS.get_or_init(|| {
+        // Parse every `<rect x="N" y="N" .../>` from the canonical SVG. The
+        // file is a pure 1-bit pixel grid with fixed 8px cells, so we just
+        // collect coordinates — no general SVG parser needed.
+        let svg = include_str!("../../../assets/logo/kookaburra.svg");
+        let mut raw: Vec<(u16, u16)> = Vec::new();
+        for line in svg.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("<rect ") else {
+                continue;
+            };
+            let x = attr_u16(rest, "x=\"");
+            let y = attr_u16(rest, "y=\"");
+            if let (Some(x), Some(y)) = (x, y) {
+                raw.push((x, y));
+            }
+        }
+        let min_x = raw.iter().map(|&(x, _)| x).min().unwrap_or(0);
+        let min_y = raw.iter().map(|&(_, y)| y).min().unwrap_or(0);
+        let max_x = raw.iter().map(|&(x, _)| x).max().unwrap_or(0);
+        let max_y = raw.iter().map(|&(_, y)| y).max().unwrap_or(0);
+        let cells = raw
+            .into_iter()
+            .map(|(x, y)| (((x - min_x) / 8) as u8, ((y - min_y) / 8) as u8))
+            .collect();
+        LogoPixels {
+            cells,
+            // +1 because the max rect itself occupies one cell.
+            width: ((max_x - min_x) / 8) as u8 + 1,
+            height: ((max_y - min_y) / 8) as u8 + 1,
+        }
+    })
+}
+
+fn attr_u16(s: &str, key: &str) -> Option<u16> {
+    let start = s.find(key)? + key.len();
+    let rest = &s[start..];
+    let end = rest.find('"')?;
+    rest[..end].parse().ok()
+}
+
 fn logo_placeholder(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+    // Allocate roughly the strip's safe height so the bird reads at the
+    // same visual weight as the old "K" glyph. 1 SVG cell = 1 display px
+    // keeps the 1-bit pixel art crisp; the accent-amber fill matches the
+    // rest of the strip's signature highlights.
+    let pixels = logo_pixels();
+    let cell_size = 1.0_f32;
+    let bird_w = pixels.width as f32 * cell_size;
+    let bird_h = pixels.height as f32 * cell_size;
+    // Pad by a pixel on every side so the animation bob/peck doesn't clip
+    // against neighboring widgets.
+    let alloc = Vec2::new(bird_w + 4.0, bird_h + 4.0);
+    let (rect, _) = ui.allocate_exact_size(alloc, Sense::hover());
     let painter = ui.painter();
     let t = ui.ctx().input(|i| i.time);
 
@@ -617,26 +697,26 @@ fn logo_placeholder(ui: &mut egui::Ui) {
     // a small vertical dip + horizontal nudge during the "peck" phase.
     let peck_cycle = (t % 1.6) / 1.6;
     let (peck_dx, peck_dy) = if peck_cycle < 0.15 {
-        // Down-peck: dip 2px forward-down.
         let p = (peck_cycle / 0.15) as f32;
         (p * 1.5, p * 2.0)
     } else if peck_cycle < 0.30 {
-        // Return: back to rest.
         let p = ((peck_cycle - 0.15) / 0.15) as f32;
         ((1.0 - p) * 1.5, (1.0 - p) * 2.0)
     } else {
         (0.0, 0.0)
     };
 
-    let center = rect.center() + Vec2::new(peck_dx, bob + peck_dy);
-    // Draw a pixel-art K: big monospace glyph
-    painter.text(
-        center,
-        egui::Align2::CENTER_CENTER,
-        "K",
-        FontId::monospace(24.0),
-        ACCENT,
-    );
+    // Top-left of the bird's bounding box, centered inside `rect` and
+    // snapped to the pixel grid so the 1×1 cells stay crisp.
+    let origin = rect.center() - Vec2::new(bird_w, bird_h) * 0.5
+        + Vec2::new(peck_dx, bob + peck_dy);
+    let origin = egui::pos2(origin.x.round(), origin.y.round());
+
+    for &(cx, cy) in &pixels.cells {
+        let min = origin + Vec2::new(cx as f32 * cell_size, cy as f32 * cell_size);
+        let cell = Rect::from_min_size(min, Vec2::splat(cell_size));
+        painter.rect_filled(cell, Rounding::ZERO, ACCENT);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -651,36 +731,23 @@ fn draw_card(
     activity: bool,
     generating: bool,
     dragging: bool,
-    squishing: bool,
+    squish_elapsed: Option<f32>,
     time_secs: f64,
 ) -> egui::Response {
-    // koo-ws-squish: a quick scale-bounce when switching to this card.
-    // v2 keyframes:
-    //   0%   scaleX(0.6) scaleY(1.15)  — compressed horizontally, tall
-    //   60%  scaleX(1.08) scaleY(0.94) — overshot wide, short
-    //   100% scaleX(1) scaleY(1)       — settle
-    // 340ms total, cubic-bezier(.2,.9,.3,1.3).
-    let (squish_sx, squish_sy) = if squishing {
-        // Use a simple linear interpolation through the keyframes.
-        // The egui time-based animation won't perfectly match CSS beziers
-        // but captures the feel.
-        let t_frac = ((time_secs * 1000.0) % 340.0) / 340.0;
-        if t_frac < 0.6 {
-            let p = (t_frac / 0.6) as f32;
-            // 0→60%: scaleX 0.6→1.08, scaleY 1.15→0.94
-            let sx = 0.6 + p * 0.48;
-            let sy = 1.15 - p * 0.21;
-            (sx, sy)
-        } else {
-            let p = ((t_frac - 0.6) / 0.4) as f32;
-            // 60→100%: scaleX 1.08→1.0, scaleY 0.94→1.0
-            let sx = 1.08 - p * 0.08;
-            let sy = 0.94 + p * 0.06;
-            (sx, sy)
-        }
+    // koo-ws-squish: a gentle press-in-and-release on workspace switch.
+    // Both axes start at SQUISH_START_SCALE and ease up to 1.0 with a
+    // cubic ease-out (1 - (1-t)^3). No overshoot and no axis asymmetry —
+    // the card only shrinks into its resting footprint, so the bottom
+    // accent bar never slides past its resting Y and the terminal grid
+    // below stays visually stationary.
+    let squish_scale = if let Some(elapsed) = squish_elapsed {
+        let t = (elapsed / SQUISH_DURATION as f32).clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - t).powi(3);
+        SQUISH_START_SCALE + (1.0 - SQUISH_START_SCALE) * eased
     } else {
-        (1.0, 1.0)
+        1.0
     };
+    let (squish_sx, squish_sy) = (squish_scale, squish_scale);
     // Active cards lift -2px (translateY), inactive scale to 0.96.
     let inactive_scale = if active { 1.0 } else { 0.96 };
     let card_h = CARD_HEIGHT * squish_sy * inactive_scale;

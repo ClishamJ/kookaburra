@@ -81,6 +81,24 @@ pub struct RenderTile {
     /// repaints in its normal color on the next frame.
     pub bell_flash: bool,
     pub update: Option<TileSnapshot>,
+    /// Live click-feedback particles owned by the app. Coordinates are in
+    /// tile-local logical pixels (0,0 = tile top-left). Empty on most
+    /// frames — only populated immediately after a click and for the
+    /// ~320ms the burst lasts.
+    pub particles: Vec<RenderParticle>,
+}
+
+/// One particle quad. Produced by the app each frame from its live
+/// `ParticleBurst` state, consumed by `emit_tile` as a flat colored quad.
+#[derive(Copy, Clone, Debug)]
+pub struct RenderParticle {
+    /// Top-left of the quad, tile-local logical px.
+    pub x: f32,
+    pub y: f32,
+    /// Square side length, logical px.
+    pub size: f32,
+    /// Premultiplied-alpha-ready color. `a` carries the fade.
+    pub color: Rgba,
 }
 
 /// Cell font metrics.
@@ -320,6 +338,7 @@ impl Renderer {
                     t.follow_mode,
                     t.tile_index,
                     t.bell_flash,
+                    &t.particles,
                     t_secs,
                 );
             }
@@ -412,6 +431,7 @@ impl Renderer {
         _follow_mode: bool,
         tile_index: usize,
         bell_flash: bool,
+        particles: &[RenderParticle],
         t_secs: f64,
     ) {
         if snap.cols == 0 || snap.rows == 0 || snap.cells.is_empty() {
@@ -606,6 +626,14 @@ impl Renderer {
                 };
                 pipeline.push_fg(glyph, cx, by, fg, queue);
             }
+        }
+
+        // --- click-feedback particles ---
+        // Push as bg quads so the bg pipeline's src-over blend handles the
+        // per-particle alpha fade. They land in front of cell backgrounds
+        // but behind glyphs (glyphs are a separate pass drawn after bg).
+        for p in particles {
+            pipeline.push_bg(rect.x + p.x, rect.y + p.y, p.size, p.size, p.color);
         }
     }
 }
