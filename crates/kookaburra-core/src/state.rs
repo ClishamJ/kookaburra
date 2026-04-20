@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::config::Config;
+use crate::config::{Config, Theme};
 use crate::ids::{PtyId, TileId, WorkspaceId};
 use crate::layout::Layout;
 use crate::worktree::Worktree;
@@ -81,6 +81,32 @@ impl AppState {
         self.workspaces.iter_mut().find_map(|w| w.tile_mut(id))
     }
 
+    /// Resolve the tile that should receive keyboard input right now.
+    ///
+    /// Precedence:
+    /// 1. `focused_tile` if set and resolvable (so deliberate focus — from
+    ///    `FocusTile`, click-to-focus, `Cmd+Opt+N`, etc. — is always
+    ///    honored, even on empty slots where Enter deliberately spawns).
+    /// 2. First *live* tile in the active workspace (prevents focus from
+    ///    silently falling onto an empty slot when the workspace has a
+    ///    usable terminal elsewhere).
+    /// 3. `tiles.first()` of the active workspace (all-empty workspaces,
+    ///    where we want Enter to spawn the first terminal).
+    #[must_use]
+    pub fn active_tile(&self) -> Option<TileId> {
+        let ws = self.active_workspace();
+        if let Some(id) = self.focused_tile {
+            if ws.tile(id).is_some() {
+                return Some(id);
+            }
+        }
+        ws.tiles
+            .iter()
+            .find(|t| t.is_live())
+            .map(|t| t.id)
+            .or_else(|| ws.tiles.first().map(|t| t.id))
+    }
+
     /// Returns `true` if any workspace contains any tile with new output
     /// since last frame (cheap scan, used for the "unread" strip signal).
     #[must_use]
@@ -100,6 +126,18 @@ impl AppState {
     pub fn request_redraw(&mut self) {
         self.needs_redraw = true;
     }
+
+    /// Resolve the effective theme for a workspace. A workspace with a
+    /// `theme_override` set to a resolvable builtin name uses that theme;
+    /// otherwise falls back to the config default. Unknown override names
+    /// fall through silently — users never see a crash from a stale name.
+    #[must_use]
+    pub fn effective_theme(&self, ws: WorkspaceId) -> Theme {
+        self.workspace(ws)
+            .and_then(|w| w.theme_override.as_deref())
+            .and_then(Theme::builtin)
+            .unwrap_or_else(|| self.config.theme.clone())
+    }
 }
 
 /// A named group of related tiles. Maps 1:1 to a card in the strip.
@@ -112,6 +150,14 @@ pub struct Workspace {
     /// Optional designated tile that gets focus when switching to this
     /// workspace.
     pub primary_tile: Option<TileId>,
+    /// Optional per-workspace theme override. `None` means use the config
+    /// default. Set via the bottom-right swatch picker; references a
+    /// builtin theme name (resolved case/space-insensitive by
+    /// `Theme::builtin`).
+    pub theme_override: Option<String>,
+    /// Default working directory for new tiles spawned in this workspace.
+    /// `None` means "process cwd". Worktree cwd, when present, overrides.
+    pub default_cwd: Option<std::path::PathBuf>,
 }
 
 impl Workspace {
@@ -129,6 +175,8 @@ impl Workspace {
             layout,
             tiles,
             primary_tile: None,
+            theme_override: None,
+            default_cwd: None,
         }
     }
 
@@ -184,6 +232,10 @@ pub struct Tile {
     pub worktree: Option<Worktree>,
     /// Whether the user has rung the bell since we last drew.
     pub bell_pending: bool,
+    /// Wall-clock timestamp of the most recent bell, if any. Drives the
+    /// brief (~150ms) header flash in the renderer. Independent of
+    /// `bell_pending`, which is intended for a persistent indicator.
+    pub last_bell_at: Option<Instant>,
     /// Wall-clock timestamp of the last PTY output batch, if any. Used by
     /// the strip to render a "generating" / recent-activity signal on
     /// workspace cards. Stays `None` for tiles that have never emitted
@@ -214,6 +266,7 @@ impl Tile {
             cwd: None,
             worktree: None,
             bell_pending: false,
+            last_bell_at: None,
             last_output_at: None,
         }
     }
@@ -230,6 +283,7 @@ impl Tile {
             cwd: None,
             worktree: None,
             bell_pending: false,
+            last_bell_at: None,
             last_output_at: None,
         }
     }
@@ -261,6 +315,7 @@ impl Tile {
         self.cwd = None;
         self.last_output_at = None;
         self.bell_pending = false;
+        self.last_bell_at = None;
         self.follow_mode = true;
         Some(pty)
     }
@@ -279,6 +334,7 @@ impl Tile {
         self.cwd = src.cwd.take();
         self.last_output_at = src.last_output_at.take();
         self.bell_pending = std::mem::replace(&mut src.bell_pending, false);
+        self.last_bell_at = src.last_bell_at.take();
         self.follow_mode = std::mem::replace(&mut src.follow_mode, true);
     }
 
@@ -311,6 +367,12 @@ mod tests {
     }
 
     #[test]
+    fn workspace_new_has_no_default_cwd() {
+        let ws = Workspace::new("scratch");
+        assert!(ws.default_cwd.is_none());
+    }
+
+    #[test]
     fn workspace_new_fills_tiles_with_cell_count_empties() {
         let ws = Workspace::new("scratch");
         assert_eq!(ws.tiles.len(), ws.layout.cell_count());
@@ -330,6 +392,44 @@ mod tests {
     fn active_workspace_returns_pointer_to_first_workspace() {
         let s = AppState::new(Config::default());
         assert_eq!(s.active_workspace().id, s.workspaces[0].id);
+    }
+
+    #[test]
+    fn active_tile_prefers_live_tile_when_focus_is_unset() {
+        // Regression for the "Enter spawns a new window" bug: when
+        // focused_tile is None, the fallback must pick the first *live*
+        // tile in the active workspace, not tiles[0] (which is always an
+        // empty slot in a freshly-created workspace).
+        let mut s = AppState::new(Config::default());
+        let live_id = s.active_workspace().tiles[3].id;
+        s.active_workspace_mut()
+            .tile_mut(live_id)
+            .unwrap()
+            .promote(dummy_pty());
+        assert_eq!(s.focused_tile, None);
+        assert_eq!(s.active_tile(), Some(live_id));
+    }
+
+    #[test]
+    fn active_tile_returns_focused_tile_when_live() {
+        let mut s = AppState::new(Config::default());
+        let live_id = s.active_workspace().tiles[2].id;
+        s.active_workspace_mut()
+            .tile_mut(live_id)
+            .unwrap()
+            .promote(dummy_pty());
+        s.focused_tile = Some(live_id);
+        assert_eq!(s.active_tile(), Some(live_id));
+    }
+
+    #[test]
+    fn active_tile_falls_back_to_empty_slot_when_no_live_tiles_exist() {
+        // In a fresh all-empty workspace, `active_tile` must still return
+        // tiles[0] so the empty-slot Enter-promotion path continues to
+        // work for users who just created a workspace.
+        let s = AppState::new(Config::default());
+        let first_id = s.active_workspace().tiles[0].id;
+        assert_eq!(s.active_tile(), Some(first_id));
     }
 
     #[test]
@@ -441,6 +541,29 @@ mod tests {
         let mut t = Tile::empty();
         assert!(t.demote().is_none());
         assert!(!t.is_live());
+    }
+
+    #[test]
+    fn effective_theme_returns_config_default_without_override() {
+        let s = AppState::new(Config::default());
+        let theme = s.effective_theme(s.active_workspace);
+        assert_eq!(theme.name, s.config.theme.name);
+    }
+
+    #[test]
+    fn effective_theme_returns_builtin_when_override_is_set() {
+        let mut s = AppState::new(Config::default());
+        s.active_workspace_mut().theme_override = Some("Tokyo Night".into());
+        let theme = s.effective_theme(s.active_workspace);
+        assert_eq!(theme.name, "Tokyo Night");
+    }
+
+    #[test]
+    fn effective_theme_falls_back_on_unresolvable_override() {
+        let mut s = AppState::new(Config::default());
+        s.active_workspace_mut().theme_override = Some("Nonexistent".into());
+        let theme = s.effective_theme(s.active_workspace);
+        assert_eq!(theme.name, s.config.theme.name);
     }
 
     #[test]
