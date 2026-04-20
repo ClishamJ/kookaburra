@@ -79,6 +79,14 @@ pub enum Action {
         scope: SearchScope,
     },
     ClearTileDirty(TileId),
+    /// Set or clear the per-workspace theme override. `theme_name = None`
+    /// reverts the workspace to the config default. The name is resolved
+    /// against `Theme::builtin`; unresolvable names are stored as-is and
+    /// `effective_theme` falls through to the default.
+    SetWorkspaceTheme {
+        workspace: WorkspaceId,
+        theme_name: Option<String>,
+    },
 }
 
 /// Side effects the action handler may need to ask the PTY layer to
@@ -118,11 +126,17 @@ pub fn apply_action(state: &mut AppState, pty: &mut dyn PtySideEffects, action: 
         Action::SwitchWorkspace(id) => {
             if state.workspace(id).is_some() {
                 state.active_workspace = id;
-                // When switching, honor primary tile if set, else focus
-                // the first tile in the workspace.
-                let primary = state.active_workspace().primary_tile;
-                let first = state.active_workspace().tiles.first().map(|t| t.id);
-                state.focused_tile = primary.or(first);
+                // When switching, honor primary tile if set. Otherwise
+                // prefer the first *live* tile — never silently drop focus
+                // onto an empty slot when a usable terminal exists, since
+                // empty slots reinterpret Enter as "spawn a new window".
+                // Fall back to tiles[0] only for all-empty workspaces, so
+                // users who just created a workspace can Enter to spawn.
+                let ws = state.active_workspace();
+                let primary = ws.primary_tile;
+                let first_live = ws.tiles.iter().find(|t| t.is_live()).map(|t| t.id);
+                let first = ws.tiles.first().map(|t| t.id);
+                state.focused_tile = primary.or(first_live).or(first);
             }
         }
         Action::CreateWorkspace => {
@@ -150,10 +164,14 @@ pub fn apply_action(state: &mut AppState, pty: &mut dyn PtySideEffects, action: 
                 state.workspaces.push(ws);
                 state.focused_tile = None;
             } else if state.active_workspace == id {
-                let next_id = state.workspaces[0].id;
-                let first_tile = state.workspaces[0].tiles.first().map(|t| t.id);
-                state.active_workspace = next_id;
-                state.focused_tile = first_tile;
+                let next_ws = &state.workspaces[0];
+                // Mirror SwitchWorkspace: prefer a live tile over an empty
+                // slot at index 0, so the first keystroke after deletion
+                // doesn't land on an empty-slot Enter-promotion path.
+                let first_live = next_ws.tiles.iter().find(|t| t.is_live()).map(|t| t.id);
+                let first = next_ws.tiles.first().map(|t| t.id);
+                state.active_workspace = next_ws.id;
+                state.focused_tile = first_live.or(first);
             }
         }
         Action::RenameWorkspace { id, new_label } => {
@@ -237,6 +255,15 @@ pub fn apply_action(state: &mut AppState, pty: &mut dyn PtySideEffects, action: 
             // (which tagged events with that id at spawn time) continues
             // to land on the right slot.
             state.workspaces[dst_wi].tiles[dst_ti] = moved;
+            // If the user was focused on the tile we just moved, clear
+            // focus so the next keystroke in the source workspace doesn't
+            // traverse `state.tile()` (which resolves globally) and write
+            // bytes into a terminal across the strip that the user can't
+            // see. `active_tile()` will fall back to the source workspace's
+            // first live tile — or to an empty slot if none remain.
+            if state.focused_tile == Some(tile_id) {
+                state.focused_tile = None;
+            }
         }
         Action::MoveTileToNewWorkspace { tile_id } => {
             let Some((src_wi, src_ti)) = find_tile_loc(state, tile_id) else {
@@ -285,6 +312,14 @@ pub fn apply_action(state: &mut AppState, pty: &mut dyn PtySideEffects, action: 
         Action::ClearTileDirty(tile_id) => {
             if let Some(tile) = state.tile_mut(tile_id) {
                 tile.has_new_output = false;
+            }
+        }
+        Action::SetWorkspaceTheme {
+            workspace,
+            theme_name,
+        } => {
+            if let Some(ws) = state.workspace_mut(workspace) {
+                ws.theme_override = theme_name;
             }
         }
     }
@@ -626,6 +661,155 @@ mod tests {
         assert_eq!(after.tiles.len(), before_tiles);
         assert!(after.tiles[0].is_live());
         assert_eq!(after.tiles[0].id, tile_id);
+    }
+
+    #[test]
+    fn switch_workspace_focuses_first_live_tile_when_slot_zero_is_empty() {
+        // Regression for the "Enter spawns a new window" bug: when switching
+        // into a workspace that has a live tile at a non-zero index, focus
+        // must land on the live tile, not on the empty slot at index 0.
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let origin_ws = state.active_workspace;
+        // Make a second workspace and spawn a tile at slot index 2 (slots 0
+        // and 1 stay empty).
+        apply_action(&mut state, &mut pty, Action::CreateWorkspace);
+        let target_ws = state.active_workspace;
+        let live_tile_id = state.active_workspace().tiles[2].id;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SpawnInTile {
+                tile_id: live_tile_id,
+                worktree: None,
+            },
+        );
+        // Bounce back to the origin then switch into the target. Switching
+        // must focus the live tile, not tiles[0] (empty).
+        apply_action(&mut state, &mut pty, Action::SwitchWorkspace(origin_ws));
+        apply_action(&mut state, &mut pty, Action::SwitchWorkspace(target_ws));
+        assert_eq!(
+            state.focused_tile,
+            Some(live_tile_id),
+            "SwitchWorkspace must prefer a live tile to an empty slot"
+        );
+    }
+
+    #[test]
+    fn delete_workspace_focus_lands_on_live_tile_in_fallback_workspace() {
+        // Regression: after DeleteWorkspace re-homes focus to workspaces[0],
+        // it must pick the first *live* tile there, not tiles[0] (which may
+        // be empty).
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        // workspaces[0] has a live tile in slot 1, not slot 0.
+        let live_tile_id = state.active_workspace().tiles[1].id;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SpawnInTile {
+                tile_id: live_tile_id,
+                worktree: None,
+            },
+        );
+        // Create a second workspace (so deleting it is meaningful) and
+        // switch to it so we're deleting the *active* workspace.
+        apply_action(&mut state, &mut pty, Action::CreateWorkspace);
+        let victim = state.active_workspace;
+        apply_action(&mut state, &mut pty, Action::DeleteWorkspace(victim));
+        assert_eq!(
+            state.focused_tile,
+            Some(live_tile_id),
+            "DeleteWorkspace fallback must prefer a live tile in workspaces[0]"
+        );
+    }
+
+    #[test]
+    fn move_tile_clears_focus_when_moved_tile_was_focused() {
+        // Regression: MoveTile moves a live tile into another workspace but
+        // historically left `focused_tile` pointing at the moved tile's id.
+        // Because `state.tile()` resolves globally, subsequent keystrokes in
+        // the *source* workspace would still hit the moved tile across the
+        // strip. After the fix, focus is cleared when the moved tile was
+        // the focused one; the source workspace has no focus until the
+        // user picks a new tile.
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let source_ws = state.active_workspace;
+        let tile_id = state.active_workspace().tiles[0].id;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SpawnInTile {
+                tile_id,
+                worktree: None,
+            },
+        );
+        // Create a destination workspace then switch back to the source —
+        // mirroring the real drag-to-card flow where the user is still
+        // looking at the source workspace when the move lands.
+        apply_action(&mut state, &mut pty, Action::CreateWorkspace);
+        let target_ws = state.active_workspace;
+        apply_action(&mut state, &mut pty, Action::SwitchWorkspace(source_ws));
+        assert_eq!(state.focused_tile, Some(tile_id));
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::MoveTile {
+                tile_id,
+                target_workspace: target_ws,
+            },
+        );
+        assert_ne!(
+            state.focused_tile,
+            Some(tile_id),
+            "MoveTile must not leave focus pointing at a tile that lives \
+             in a different workspace"
+        );
+    }
+
+    #[test]
+    fn set_workspace_theme_sets_and_clears_override() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let ws_id = state.active_workspace;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SetWorkspaceTheme {
+                workspace: ws_id,
+                theme_name: Some("Tokyo Night".into()),
+            },
+        );
+        assert_eq!(
+            state.workspace(ws_id).unwrap().theme_override.as_deref(),
+            Some("Tokyo Night")
+        );
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SetWorkspaceTheme {
+                workspace: ws_id,
+                theme_name: None,
+            },
+        );
+        assert!(state.workspace(ws_id).unwrap().theme_override.is_none());
+    }
+
+    #[test]
+    fn set_workspace_theme_on_unknown_workspace_is_noop() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SetWorkspaceTheme {
+                workspace: WorkspaceId::new(),
+                theme_name: Some("Tokyo Night".into()),
+            },
+        );
+        // Original workspace still has no override.
+        assert!(state.active_workspace().theme_override.is_none());
     }
 
     #[test]

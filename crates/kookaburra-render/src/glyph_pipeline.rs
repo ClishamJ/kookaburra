@@ -118,16 +118,56 @@ pub struct LoadedFont {
 
 impl LoadedFont {
     /// Load a monospace font via the given glyphon `FontSystem` and
-    /// compute cell metrics for the requested pixel size. Picks the
-    /// first monospace regular face fontdb knows about.
-    pub fn from_font_system(font_system: &mut glyphon::FontSystem, size_px: f32) -> Option<Self> {
+    /// compute cell metrics for the requested pixel size.
+    ///
+    /// If `family` is provided, resolves it case-insensitively against
+    /// the system font database (matches on any face whose family list
+    /// contains that name) and prefers regular over italic/bold. Falls
+    /// back to the first monospace regular face when the requested
+    /// family isn't installed — with a warn-level log so users can tell
+    /// their config choice didn't take.
+    pub fn from_font_system(
+        font_system: &mut glyphon::FontSystem,
+        family: Option<&str>,
+        size_px: f32,
+    ) -> Option<Self> {
         let db = font_system.db();
-        // Find a monospace regular face. On macOS fontdb will populate
-        // SFMono, Menlo, Monaco, etc.
-        let face = db
-            .faces()
-            .find(|f| f.monospaced && matches!(f.style, glyphon::fontdb::Style::Normal))
+
+        let family_matches = |f: &glyphon::fontdb::FaceInfo, target: &str| -> bool {
+            f.families
+                .iter()
+                .any(|(name, _lang)| name.eq_ignore_ascii_case(target))
+        };
+
+        // Preferred: user-configured family, regular style.
+        let face = family
+            .and_then(|fam| {
+                db.faces()
+                    .find(|f| {
+                        family_matches(f, fam) && matches!(f.style, glyphon::fontdb::Style::Normal)
+                    })
+                    .or_else(|| db.faces().find(|f| family_matches(f, fam)))
+            })
+            // Fall back to any monospace regular face.
+            .or_else(|| {
+                db.faces()
+                    .find(|f| f.monospaced && matches!(f.style, glyphon::fontdb::Style::Normal))
+            })
             .or_else(|| db.faces().find(|f| f.monospaced))?;
+
+        if let Some(want) = family {
+            let got = face
+                .families
+                .first()
+                .map(|(n, _)| n.as_str())
+                .unwrap_or("?");
+            if !got.eq_ignore_ascii_case(want) {
+                log::warn!(
+                    "configured font family '{want}' not found; using '{got}' (monospace fallback)"
+                );
+            }
+        }
+
         let face_id = face.id;
         let face_index = face.index;
 

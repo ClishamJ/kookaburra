@@ -117,19 +117,19 @@ Checklist mirrors §8 of the spec. Tick items as they land. Sub-items that aren'
 - [x] Scrollback: mouse wheel (keyboard TBD alongside in-tile search)
 - [x] Cursor rendering (fg-color swap on cursor cell; `theme.cursor`)
 - [ ] `Cmd+F` in-tile search via `alacritty_terminal::RegexSearch`
-- [ ] Bell handling + visual indicator
+- [x] Bell handling + visual indicator — `EventProxy` sets `Tile::bell_pending` / `last_bell_at`; the tile's header bar flashes `ansi(1)` red for 150 ms then clears. Redraw is re-requested while the flash is live so it fades out cleanly.
 - [x] OSC title changes → `Tile::title` (wired via `EventProxy`)
 - [ ] OSC hyperlinks (render + click)
 - [ ] New-output highlight (the "unread" edge pulse)
 
 ### Phase 5 — Polish and config
 
-- [ ] TOML config load from XDG path via `directories`
-- [ ] `notify`-based hot reload
-- [ ] Keybinding system driven by config
-- [ ] Theme system + external theme files
-- [ ] Builtin themes: Tokyo Night, Catppuccin Mocha, Solarized Dark
-- [ ] Font configuration + live switching
+- [x] TOML config load from XDG path via `directories` — `Config::load_or_default` reads `<xdg>/kookaburra/config.toml`; missing = defaults, malformed = logged + defaults (never panics).
+- [x] `notify`-based hot reload — watcher sits on the config dir (parent, not file) so rename-and-replace editors still trigger; changes to `config.toml` fire `AppEvent::ConfigReloaded` onto the winit proxy. Theme + keybindings swap live; font changes are logged as restart-required.
+- [x] Keybinding system driven by config — `[keybindings]` parses into `Keybindings`, pre-resolved to `ResolvedKeybindings` at load + hot-reload time; `handle_app_shortcut` dispatches via chord match instead of hard-coded literals. Malformed entries fall back to defaults with a warn log.
+- [x] Theme system + external theme files — `theme = "Name"` resolves to a builtin or `<xdg>/kookaburra/themes/<kebab>.toml`; inline `[theme]` tables with full palettes also supported.
+- [x] Builtin themes: Tokyo Night, Catppuccin Mocha, Solarized Dark (+ Kookaburra default) — all exposed via `Theme::builtin(name)` / `Theme::builtin_names()`.
+- [~] Font configuration + live switching — `[font]` with `family` + `size_px` threads through to `LoadedFont::from_font_system`, which picks the requested family (regular weight preferred, any-weight fallback) and warn-logs if the family isn't installed. Live switching not yet wired — a font change via hot-reload logs "restart required" and keeps the old face.
 - [ ] Background font enumeration on startup (keep cold start fast)
 - [x] `Cmd+Enter` zen mode (maximize focused tile; strip not drawn yet)
 - [ ] Output-aware dimming tuned

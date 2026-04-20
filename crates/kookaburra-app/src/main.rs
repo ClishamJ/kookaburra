@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use kookaburra_core::action::{apply_action, Action, PtySideEffects};
 use kookaburra_core::config::Config;
 use kookaburra_core::ids::{PtyId, TileId};
+use kookaburra_core::keybinding::{Chord, ChordKey, NamedChordKey, ResolvedKeybindings};
 use kookaburra_core::layout::{compute_tile_rects, Layout, Rect};
 use kookaburra_core::snapshot::TileSnapshot;
 use kookaburra_core::state::AppState;
@@ -23,6 +24,7 @@ use kookaburra_ui::{
     EventResponse, PreparedFrame, TileDragGhost, UiLayer, STATUS_BAR_HEIGHT, STRIP_HEIGHT,
 };
 
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use portable_pty::PtySize;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -40,6 +42,19 @@ const WINDOW_INSET_PX: f32 = 8.0;
 /// to a tile drag-to-card. Matches egui's own default threshold.
 const DRAG_THRESHOLD_PX: f64 = 6.0;
 
+/// Per-frame seed data we collect for each tile before issuing
+/// `RenderTile` commands. Split out so we can iterate the workspace once
+/// and then do the render plumbing without re-borrowing `self.state`.
+struct RenderTileSeed {
+    tile_id: TileId,
+    pty_id: Option<PtyId>,
+    title: String,
+    generating: bool,
+    primary: bool,
+    follow_mode: bool,
+    bell_flash: bool,
+}
+
 /// A pending left-press on a tile. We defer the focus-vs-drag decision
 /// until the user either releases the button (→ focus) or moves past the
 /// threshold (→ drag).
@@ -49,19 +64,31 @@ struct PressPending {
     phys_pos: PhysicalPosition<f64>,
 }
 
+/// Unified wake-up channel for the winit main loop. Carries PTY output
+/// events plus config-file-changed notifications from the `notify`
+/// watcher — anything that needs to pre-empt winit's `ControlFlow::Wait`
+/// goes through here.
+#[derive(Debug)]
+enum AppEvent {
+    Pty(PtyEvent),
+    /// The config file on disk changed. The main loop re-reads it and
+    /// hot-swaps the relevant runtime state.
+    ConfigReloaded,
+}
+
 /// Sink the PTY reader threads emit into. Each call pushes the event onto
 /// the winit event loop, which wakes `ApplicationHandler::user_event`
 /// immediately. Without this, winit sleeps on `ControlFlow::Wait` and
 /// shell output sits un-rendered until the user presses another key,
 /// which felt like severe typing lag in the previous revision.
-struct WinitSink(EventLoopProxy<PtyEvent>);
+struct WinitSink(EventLoopProxy<AppEvent>);
 
 impl PtyEventSink for WinitSink {
     fn emit(&self, event: PtyEvent) {
         // Send-event can fail once the event loop has exited. We silently
         // drop in that case — the PTY reader will notice next time the
         // process closes.
-        let _ = self.0.send_event(event);
+        let _ = self.0.send_event(AppEvent::Pty(event));
     }
 }
 
@@ -95,6 +122,9 @@ impl<'a> PtySideEffects for PtyAdapter<'a> {
 
 struct App {
     config: Config,
+    /// Pre-parsed chord form of `config.keybindings`. Rebuilt whenever
+    /// config is (re)loaded.
+    keybindings: ResolvedKeybindings,
     state: AppState,
     pty_manager: PtyManager,
     ui: Option<UiLayer>,
@@ -125,15 +155,21 @@ struct App {
     renderer: Option<Renderer>,
     last_frame: Instant,
     starter_spawned: bool,
+    /// Held-alive so the notify file watcher keeps firing. Dropped at app
+    /// shutdown.
+    _config_watcher: Option<RecommendedWatcher>,
 }
 
 impl App {
-    fn new(proxy: EventLoopProxy<PtyEvent>) -> Self {
+    fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
         let config = Config::load_or_default();
+        let keybindings = ResolvedKeybindings::from_config(&config.keybindings);
         let state = AppState::new(config.clone());
-        let sink: Arc<dyn PtyEventSink> = Arc::new(WinitSink(proxy));
+        let sink: Arc<dyn PtyEventSink> = Arc::new(WinitSink(proxy.clone()));
+        let watcher = spawn_config_watcher(proxy);
         Self {
             config,
+            keybindings,
             state,
             pty_manager: PtyManager::new(sink),
             ui: None,
@@ -153,13 +189,12 @@ impl App {
             renderer: None,
             last_frame: Instant::now(),
             starter_spawned: false,
+            _config_watcher: watcher,
         }
     }
 
     fn active_tile(&self) -> Option<TileId> {
-        self.state
-            .focused_tile
-            .or_else(|| self.state.active_workspace().tiles.first().map(|t| t.id))
+        self.state.active_tile()
     }
 
     fn active_pty(&self) -> Option<PtyId> {
@@ -317,6 +352,15 @@ impl App {
             PtyEvent::BellRang { tile_id } => {
                 if let Some(tile) = self.state.tile_mut(tile_id) {
                     tile.bell_pending = true;
+                    tile.last_bell_at = Some(Instant::now());
+                }
+                // A tile needs a reshape to paint its header with the
+                // flash color, and we need another redraw scheduled so the
+                // flash clears itself when the window ends.
+                self.dirty_tiles.insert(tile_id);
+                self.state.request_redraw();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
                 }
             }
         }
@@ -423,7 +467,7 @@ impl App {
             return;
         }
         self.render_scratch.clear();
-        let theme = self.config.theme.clone();
+        let theme = self.state.effective_theme(self.state.active_workspace);
         let focused = self.state.focused_tile;
 
         // When focus changes the previously-focused and newly-focused
@@ -456,13 +500,22 @@ impl App {
                 } else {
                     None
                 };
+                let now = std::time::Instant::now();
                 let zen_generating = tile
                     .last_output_at
                     .map(|at| {
-                        std::time::Instant::now().saturating_duration_since(at)
-                            < std::time::Duration::from_millis(600)
+                        now.saturating_duration_since(at) < std::time::Duration::from_millis(600)
                     })
                     .unwrap_or(false);
+                let bell_flash = tile
+                    .last_bell_at
+                    .map(|at| {
+                        now.saturating_duration_since(at) < std::time::Duration::from_millis(150)
+                    })
+                    .unwrap_or(false);
+                if bell_flash {
+                    self.state.request_redraw();
+                }
                 let is_primary = self.state.active_workspace().primary_tile == Some(tile.id);
                 self.render_scratch.push(RenderTile {
                     tile_id: tile.id,
@@ -473,6 +526,7 @@ impl App {
                     follow_mode: tile.follow_mode,
                     tile_index: 1,
                     update,
+                    bell_flash,
                 });
             }
         } else {
@@ -481,7 +535,8 @@ impl App {
             let gen_window = std::time::Duration::from_millis(600);
             let now = std::time::Instant::now();
             let primary_tile = self.state.active_workspace().primary_tile;
-            let tiles: Vec<(TileId, Option<PtyId>, String, bool, bool, bool)> = self
+            let bell_window = std::time::Duration::from_millis(150);
+            let tiles: Vec<RenderTileSeed> = self
                 .state
                 .active_workspace()
                 .tiles
@@ -491,20 +546,33 @@ impl App {
                         .last_output_at
                         .map(|at| now.saturating_duration_since(at) < gen_window)
                         .unwrap_or(false);
+                    let bell_flash = t
+                        .last_bell_at
+                        .map(|at| now.saturating_duration_since(at) < bell_window)
+                        .unwrap_or(false);
                     let is_primary = primary_tile == Some(t.id);
-                    (
-                        t.id,
-                        t.pty_id,
-                        t.title.clone(),
+                    RenderTileSeed {
+                        tile_id: t.id,
+                        pty_id: t.pty_id,
+                        title: t.title.clone(),
                         generating,
-                        is_primary,
-                        t.follow_mode,
-                    )
+                        primary: is_primary,
+                        follow_mode: t.follow_mode,
+                        bell_flash,
+                    }
                 })
                 .collect();
-            for (i, (tile_id, pty_id_opt, title, tile_generating, tile_primary, tile_follow)) in
-                tiles.iter().enumerate()
-            {
+            if tiles.iter().any(|t| t.bell_flash) {
+                self.state.request_redraw();
+            }
+            for (i, seed) in tiles.iter().enumerate() {
+                let tile_id = &seed.tile_id;
+                let pty_id_opt = &seed.pty_id;
+                let title = &seed.title;
+                let tile_generating = &seed.generating;
+                let tile_primary = &seed.primary;
+                let tile_follow = &seed.follow_mode;
+                let tile_bell = &seed.bell_flash;
                 let Some(r) = rects.get(i).copied() else {
                     break;
                 };
@@ -534,6 +602,7 @@ impl App {
                     follow_mode: *tile_follow,
                     tile_index: i + 1,
                     update,
+                    bell_flash: *tile_bell,
                 });
             }
         }
@@ -649,57 +718,119 @@ impl App {
         }
     }
 
-    /// Cmd+Opt+1..6 = focus N-th tile, Cmd+Enter = zen, Cmd+T = new tile,
-    /// Cmd+W = close focused, Cmd+G = cycle through preset layouts.
-    /// Returns `true` when the event was consumed as a shortcut.
+    /// Dispatch an application-level shortcut. Bindings are pulled from
+    /// `self.keybindings` (derived from `config.keybindings`) so user
+    /// config can retarget them. Prefix bindings (`focus_tile_prefix`,
+    /// `switch_workspace_prefix`) match on modifier set alone and take a
+    /// trailing digit at use site. Returns `true` when the event is
+    /// consumed.
     fn handle_app_shortcut(&mut self, ev: &KeyEvent) -> bool {
         if ev.state != ElementState::Pressed {
             return false;
         }
-        let cmd = self.modifiers.super_key();
-        if !cmd {
-            return false;
-        }
-        let alt = self.modifiers.alt_key();
 
-        // Cmd+Enter: zen mode.
-        if !alt {
-            if let Key::Named(NamedKey::Enter) = &ev.logical_key {
-                self.actions.push(Action::ToggleZenMode);
-                return true;
-            }
-        }
+        let event_mods = event_modifiers(self.modifiers);
 
-        // Character-based shortcuts. `logical_key` is the key that was
-        // pressed regardless of IME / dead-key folding; `text` may be
-        // absent (Cmd suppresses .text on macOS for many combos).
-        let key_char: Option<char> = match &ev.logical_key {
-            Key::Character(s) => s.chars().next(),
+        // Current digit (if any), used by the two prefix bindings.
+        let digit = match &ev.logical_key {
+            Key::Character(s) => s
+                .chars()
+                .next()
+                .and_then(|c| c.to_ascii_lowercase().to_digit(10)),
             _ => None,
         };
-        let Some(kc) = key_char else {
-            return false;
-        };
-        let lower = kc.to_ascii_lowercase();
 
-        if alt {
-            // Cmd+Opt+1..6 — focus N-th tile.
-            if let Some(d) = lower.to_digit(10) {
-                if d == 0 {
-                    return false;
-                }
+        // Prefix+digit: focus N-th tile. Checked first because it includes
+        // Alt, so it never ambiguates with the Cmd-only prefix below.
+        if let Some(d) = digit {
+            if d >= 1
+                && self
+                    .keybindings
+                    .focus_tile_prefix
+                    .modifiers_match(&event_mods)
+            {
                 let idx = (d as usize) - 1;
                 if let Some(tile) = self.state.active_workspace().tiles.get(idx) {
                     self.actions.push(Action::FocusTile(tile.id));
                     return true;
                 }
             }
-            return false;
         }
 
-        // Cmd+1..9 — switch to N-th workspace.
-        if let Some(d) = lower.to_digit(10) {
-            if d >= 1 {
+        // Specific bindings next (they can share the switch-workspace
+        // prefix modifiers; try them first so `Cmd+T` beats a literal
+        // `Cmd+<digit>` fall-through).
+        if self.match_chord(self.keybindings.zen_mode, ev) {
+            self.actions.push(Action::ToggleZenMode);
+            return true;
+        }
+        if self.match_chord(self.keybindings.new_tile, ev) {
+            let first_empty = self
+                .state
+                .active_workspace()
+                .tiles
+                .iter()
+                .find(|t| !t.is_live())
+                .map(|t| t.id);
+            if let Some(tile_id) = first_empty {
+                self.actions.push(Action::SpawnInTile {
+                    tile_id,
+                    worktree: None,
+                });
+            }
+            return true;
+        }
+        if self.match_chord(self.keybindings.close_tile, ev) {
+            if let Some(tile_id) = self.state.focused_tile {
+                self.actions.push(Action::CloseTile(tile_id));
+            }
+            return true;
+        }
+        if self.match_chord(self.keybindings.paste, ev) {
+            self.paste_from_clipboard();
+            return true;
+        }
+        if self.match_chord(self.keybindings.copy, ev) {
+            self.copy_visible();
+            return true;
+        }
+        if self.match_chord(self.keybindings.new_workspace, ev) {
+            self.actions.push(Action::CreateWorkspace);
+            return true;
+        }
+        if self.match_chord(self.keybindings.rename_workspace, ev) {
+            let ws_id = self.state.active_workspace;
+            let label = self.state.active_workspace().label.clone();
+            if let Some(ui) = self.ui.as_mut() {
+                ui.start_rename(ws_id, label);
+            }
+            self.state.request_redraw();
+            return true;
+        }
+        if self.match_chord(self.keybindings.cycle_layout, ev) {
+            let ws_id = self.state.active_workspace;
+            let next = match self.state.active_workspace().layout {
+                Layout::Grid { cols: 1, rows: 1 } => Layout::Grid { cols: 2, rows: 1 },
+                Layout::Grid { cols: 2, rows: 1 } => Layout::Grid { cols: 2, rows: 2 },
+                Layout::Grid { cols: 2, rows: 2 } => Layout::Grid { cols: 3, rows: 2 },
+                _ => Layout::Grid { cols: 1, rows: 1 },
+            };
+            self.actions.push(Action::SetLayout {
+                workspace: ws_id,
+                layout: next,
+            });
+            return true;
+        }
+
+        // Prefix+digit: switch workspace. Checked last so any specific
+        // Cmd+<char> binding above wins over Cmd+<digit> fall-through.
+        if let Some(d) = digit {
+            if d >= 1
+                && self
+                    .keybindings
+                    .switch_workspace_prefix
+                    .modifiers_match(&event_mods)
+            {
                 let idx = (d as usize) - 1;
                 if let Some(ws) = self.state.workspaces.get(idx) {
                     self.actions.push(Action::SwitchWorkspace(ws.id));
@@ -708,68 +839,34 @@ impl App {
             }
         }
 
-        match lower {
-            't' => {
-                // Cmd+T: promote the first empty slot in the active
-                // workspace. No-op if the grid is already full.
-                let first_empty = self
-                    .state
-                    .active_workspace()
-                    .tiles
-                    .iter()
-                    .find(|t| !t.is_live())
-                    .map(|t| t.id);
-                if let Some(tile_id) = first_empty {
-                    self.actions.push(Action::SpawnInTile {
-                        tile_id,
-                        worktree: None,
-                    });
-                }
-                true
-            }
-            'w' => {
-                if let Some(tile_id) = self.state.focused_tile {
-                    self.actions.push(Action::CloseTile(tile_id));
-                }
-                true
-            }
-            'v' => {
-                self.paste_from_clipboard();
-                true
-            }
-            'c' => {
-                self.copy_visible();
-                true
-            }
-            'n' => {
-                self.actions.push(Action::CreateWorkspace);
-                true
-            }
-            'l' => {
-                // Open inline rename for the active workspace's card.
-                let ws_id = self.state.active_workspace;
-                let label = self.state.active_workspace().label.clone();
-                if let Some(ui) = self.ui.as_mut() {
-                    ui.start_rename(ws_id, label);
-                }
-                self.state.request_redraw();
-                true
-            }
-            'g' => {
-                // Cycle presets: 1x1 → 2x1 → 2x2 → 3x2 → 1x1.
-                let ws_id = self.state.active_workspace;
-                let next = match self.state.active_workspace().layout {
-                    Layout::Grid { cols: 1, rows: 1 } => Layout::Grid { cols: 2, rows: 1 },
-                    Layout::Grid { cols: 2, rows: 1 } => Layout::Grid { cols: 2, rows: 2 },
-                    Layout::Grid { cols: 2, rows: 2 } => Layout::Grid { cols: 3, rows: 2 },
-                    _ => Layout::Grid { cols: 1, rows: 1 },
-                };
-                self.actions.push(Action::SetLayout {
-                    workspace: ws_id,
-                    layout: next,
-                });
-                true
-            }
+        false
+    }
+
+    /// Compare a fully-specified chord against the current event +
+    /// modifier state. Prefix chords (no terminal key) never match here —
+    /// they go through `modifiers_match` at the call sites above.
+    fn match_chord(&self, chord: Chord, ev: &KeyEvent) -> bool {
+        let Some(key) = chord.key else {
+            return false;
+        };
+        let m = self.modifiers;
+        if chord.cmd != m.super_key()
+            || chord.alt != m.alt_key()
+            || chord.shift != m.shift_key()
+            || chord.ctrl != m.control_key()
+        {
+            return false;
+        }
+        match (key, &ev.logical_key) {
+            (ChordKey::Named(NamedChordKey::Enter), Key::Named(NamedKey::Enter)) => true,
+            (ChordKey::Named(NamedChordKey::Tab), Key::Named(NamedKey::Tab)) => true,
+            (ChordKey::Named(NamedChordKey::Space), Key::Named(NamedKey::Space)) => true,
+            (ChordKey::Named(NamedChordKey::Escape), Key::Named(NamedKey::Escape)) => true,
+            (ChordKey::Char(c), Key::Character(s)) => s
+                .chars()
+                .next()
+                .map(|ch| ch.eq_ignore_ascii_case(&c))
+                .unwrap_or(false),
             _ => false,
         }
     }
@@ -826,10 +923,57 @@ impl App {
             apply_action(&mut self.state, &mut adapter, action);
         }
         self.resize_all_ptys();
+        // If the active workspace's effective theme has drifted from the
+        // renderer's (workspace switch, SetWorkspaceTheme), swap it so the
+        // frame clear + UI chrome colors match before the next frame.
+        // Tile snapshots recolor from `effective_theme` via the dirty
+        // sweep right below.
+        if let Some(renderer) = self.renderer.as_mut() {
+            let effective = self.state.effective_theme(self.state.active_workspace);
+            if renderer.theme.name != effective.name {
+                renderer.theme = effective;
+            }
+        }
         for tile in &self.state.active_workspace().tiles {
             self.dirty_tiles.insert(tile.id);
         }
         self.state.request_redraw();
+    }
+
+    /// Hot-reload config from disk. Called when the notify watcher fires.
+    /// Theme and keybindings swap live; font family/size changes are
+    /// logged as "restart required" because they'd require a glyph
+    /// pipeline rebuild we don't do yet.
+    fn reload_config(&mut self) {
+        let new_config = Config::load_or_default();
+
+        let font_changed = new_config.font.family != self.config.font.family
+            || (new_config.font.size_px - self.config.font.size_px).abs() > f32::EPSILON;
+
+        self.keybindings = ResolvedKeybindings::from_config(&new_config.keybindings);
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.theme = new_config.theme.clone();
+        }
+        self.state.config = new_config.clone();
+        self.config = new_config;
+
+        // Every tile needs a reshape — the theme's fg/bg palette changed.
+        for tile in &self.state.active_workspace().tiles {
+            self.dirty_tiles.insert(tile.id);
+        }
+        self.state.request_redraw();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+
+        if font_changed {
+            log::info!(
+                "font config changed to {}@{}px — restart to apply (live font switching TBD)",
+                self.config.font.family,
+                self.config.font.size_px
+            );
+        }
+        log::info!("config reloaded (theme='{}')", self.config.theme.name);
     }
 
     /// Resize every live PTY so its rows/cols match the per-tile rect the
@@ -857,7 +1001,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler<PtyEvent> for App {
+impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -877,7 +1021,7 @@ impl ApplicationHandler<PtyEvent> for App {
         let renderer = Renderer::new(
             window.clone(),
             self.config.theme.clone(),
-            self.config.font.size_px,
+            self.config.font.clone(),
         );
         let ui = UiLayer::new(&window);
         self.renderer = Some(renderer);
@@ -1016,8 +1160,11 @@ impl ApplicationHandler<PtyEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: PtyEvent) {
-        self.apply_pty_event(event);
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+        match event {
+            AppEvent::Pty(ev) => self.apply_pty_event(ev),
+            AppEvent::ConfigReloaded => self.reload_config(),
+        }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -1073,7 +1220,7 @@ fn main() {
     env_logger::init();
     log::info!("Kookaburra {} starting", env!("CARGO_PKG_VERSION"));
 
-    let event_loop = EventLoop::<PtyEvent>::with_user_event()
+    let event_loop = EventLoop::<AppEvent>::with_user_event()
         .build()
         .expect("build event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -1082,6 +1229,80 @@ fn main() {
     let mut app = App::new(proxy);
     if let Err(e) = event_loop.run_app(&mut app) {
         log::error!("event loop exited with error: {e}");
+    }
+}
+
+/// Spawn a notify watcher on the config directory that emits
+/// `AppEvent::ConfigReloaded` whenever the config file changes.
+///
+/// Watches the *parent* directory (not just the file) so the watch
+/// survives editors that save via rename-and-replace — vim, VS Code, etc.
+/// Filter events down to `config.toml` before forwarding.
+///
+/// Returns `None` if:
+///   - no config dir exists on this platform, or
+///   - the config dir can't be created, or
+///   - notify itself fails to initialize (e.g. FS event backend missing).
+///
+/// A missing watcher is not fatal — the app just runs without hot reload.
+fn spawn_config_watcher(proxy: EventLoopProxy<AppEvent>) -> Option<RecommendedWatcher> {
+    use kookaburra_core::config::ConfigPaths;
+    use notify::EventKind;
+
+    let paths = ConfigPaths::discover()?;
+    if let Err(e) = std::fs::create_dir_all(&paths.config_dir) {
+        log::warn!(
+            "cannot create config dir {:?}: {e}; hot reload disabled",
+            paths.config_dir
+        );
+        return None;
+    }
+    let watched_file = paths.config_file.clone();
+    let mut watcher =
+        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let Ok(event) = res else {
+                return;
+            };
+            // Only react to actual content changes. Access events (stat,
+            // open-for-read) would spam us.
+            let is_content_change = matches!(
+                event.kind,
+                EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+            );
+            if !is_content_change {
+                return;
+            }
+            if event.paths.iter().any(|p| p == &watched_file) {
+                let _ = proxy.send_event(AppEvent::ConfigReloaded);
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                log::warn!("config watcher failed to start: {e}; hot reload disabled");
+                return None;
+            }
+        };
+    if let Err(e) = watcher.watch(&paths.config_dir, RecursiveMode::NonRecursive) {
+        log::warn!(
+            "watch({:?}) failed: {e}; hot reload disabled",
+            paths.config_dir
+        );
+        return None;
+    }
+    log::info!("watching {:?} for config changes", paths.config_file);
+    Some(watcher)
+}
+
+/// Build a modifier-only `Chord` from a winit `ModifiersState`. Used for
+/// matching prefix bindings (e.g. `Cmd+Opt` + digit) where only the
+/// modifier set matters.
+fn event_modifiers(m: ModifiersState) -> Chord {
+    Chord {
+        cmd: m.super_key(),
+        alt: m.alt_key(),
+        shift: m.shift_key(),
+        ctrl: m.control_key(),
+        key: None,
     }
 }
 

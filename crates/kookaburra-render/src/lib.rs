@@ -31,7 +31,7 @@ use wgpu::{
 };
 use winit::window::Window;
 
-use kookaburra_core::config::{Rgba, Theme};
+use kookaburra_core::config::{FontConfig, Rgba, Theme};
 use kookaburra_core::ids::TileId;
 use kookaburra_core::layout::Rect;
 use kookaburra_core::snapshot::{CellFlags, TileSnapshot};
@@ -75,6 +75,11 @@ pub struct RenderTile {
     pub follow_mode: bool,
     /// 1-based tile index within the workspace (shown in the header chip).
     pub tile_index: usize,
+    /// Brief header flash after the shell rang the bell (BEL / \a). True
+    /// from the instant of the bell until the flash window expires
+    /// (~150ms), at which point the app stops setting it and the header
+    /// repaints in its normal color on the next frame.
+    pub bell_flash: bool,
     pub update: Option<TileSnapshot>,
 }
 
@@ -151,11 +156,13 @@ pub struct Renderer {
 impl Renderer {
     /// Construct a renderer bound to the given window. Synchronous — uses
     /// `pollster` to drive the async adapter/device init.
-    pub fn new(window: Arc<Window>, theme: Theme, font_size_px: f32) -> Self {
-        pollster::block_on(Self::new_async(window, theme, font_size_px))
+    pub fn new(window: Arc<Window>, theme: Theme, font: FontConfig) -> Self {
+        pollster::block_on(Self::new_async(window, theme, font))
     }
 
-    async fn new_async(window: Arc<Window>, theme: Theme, font_size_px: f32) -> Self {
+    async fn new_async(window: Arc<Window>, theme: Theme, font: FontConfig) -> Self {
+        let font_size_px = font.size_px;
+        let font_family = font.family.clone();
         let size = window.inner_size();
         let scale_factor = window.scale_factor() as f32;
 
@@ -205,7 +212,7 @@ impl Renderer {
         surface.configure(&device, &surface_config);
 
         let mut font_system = glyphon::FontSystem::new();
-        let font = LoadedFont::from_font_system(&mut font_system, font_size_px)
+        let font = LoadedFont::from_font_system(&mut font_system, Some(&font_family), font_size_px)
             .expect("no monospace font available on this system");
         let metrics = CellMetrics {
             width: font.cell_width,
@@ -312,6 +319,7 @@ impl Renderer {
                     t.primary,
                     t.follow_mode,
                     t.tile_index,
+                    t.bell_flash,
                     t_secs,
                 );
             }
@@ -403,6 +411,7 @@ impl Renderer {
         _primary: bool,
         _follow_mode: bool,
         tile_index: usize,
+        bell_flash: bool,
         t_secs: f64,
     ) {
         if snap.cols == 0 || snap.rows == 0 || snap.cells.is_empty() {
@@ -467,8 +476,15 @@ impl Renderer {
         // --- tile header bar ---
         // Flat BG_DEEP in both states — no animated glow. Just a strip for
         // the tile index + title, with a 1px grid-line separator below.
+        // Bell flash: paint the header in the theme's red (ansi[1]) for
+        // the ~150ms flash window so it reads as alarming regardless of
+        // theme. The app clears the flash after the window expires.
         let header_h = 22.0;
-        let header_bg = Rgba::rgb(0x04, 0x03, 0x02); // BG_DEEP
+        let header_bg = if bell_flash {
+            ansi_color(theme, 1)
+        } else {
+            Rgba::rgb(0x04, 0x03, 0x02) // BG_DEEP
+        };
         pipeline.push_bg(rect.x, rect.y, tile_w, header_h, header_bg);
         pipeline.push_bg(rect.x, rect.y + header_h, tile_w, 1.0, grid_line);
 

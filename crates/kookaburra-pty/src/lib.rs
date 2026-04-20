@@ -173,6 +173,7 @@ impl PtyManager {
             cmd.cwd(cwd);
         }
         cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
         cmd.env("KOOKABURRA", "1");
 
         let _child = pair
@@ -375,7 +376,7 @@ impl PtyManager {
             let idx = viewport_row as usize * cols_usize + col;
             let cell = indexed.cell;
             let flags = convert_flags(cell.flags);
-            let (fg, bg) = resolve_colors(cell.fg, cell.bg, cell.flags, colors, theme);
+            let (fg, bg) = resolve_colors(cell.fg, cell.bg, colors, theme);
             dst.cells[idx] = RenderCell {
                 ch: cell.c,
                 fg,
@@ -492,15 +493,11 @@ fn convert_flags(flags: CellFlagsAlac) -> CellFlags {
 fn resolve_colors(
     fg: Color,
     bg: Color,
-    flags: CellFlagsAlac,
     colors: &alacritty_terminal::term::color::Colors,
     theme: &Theme,
 ) -> (Rgba, Rgba) {
-    let mut fg_rgba = resolve_color(fg, colors, theme, true);
-    let mut bg_rgba = resolve_color(bg, colors, theme, false);
-    if flags.contains(CellFlagsAlac::INVERSE) {
-        std::mem::swap(&mut fg_rgba, &mut bg_rgba);
-    }
+    let fg_rgba = resolve_color(fg, colors, theme, true);
+    let bg_rgba = resolve_color(bg, colors, theme, false);
     (fg_rgba, bg_rgba)
 }
 
@@ -524,13 +521,31 @@ fn resolve_color(
             }
             if (idx as usize) < 16 {
                 theme.ansi[idx as usize]
-            } else if is_fg {
-                theme.foreground
             } else {
-                theme.background
+                xterm_256_color(idx)
             }
         }
     }
+}
+
+/// Standard xterm 256-color palette for indices 16..=255. Indices 0..=15
+/// come from the theme's ANSI slot; this table covers the 6×6×6 color
+/// cube (16..=231) and the 24-step grayscale ramp (232..=255).
+fn xterm_256_color(idx: u8) -> Rgba {
+    const CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    if idx < 16 {
+        // Caller handles the themed 16-color range; guard is just defensive.
+        return Rgba::rgb(0, 0, 0);
+    }
+    if idx < 232 {
+        let n = idx - 16;
+        let r = CUBE[(n / 36) as usize];
+        let g = CUBE[((n / 6) % 6) as usize];
+        let b = CUBE[(n % 6) as usize];
+        return Rgba::rgb(r, g, b);
+    }
+    let level = 8 + 10 * (idx - 232);
+    Rgba::rgb(level, level, level)
 }
 
 fn named_to_theme(named: NamedColor, theme: &Theme, is_fg: bool) -> Rgba {
@@ -582,5 +597,27 @@ impl RgbaFallback for Rgba {
         } else {
             self
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xterm_256_color_cube_boundaries() {
+        // First cube entry: index 16 → (0, 0, 0).
+        assert_eq!(xterm_256_color(16), Rgba::rgb(0, 0, 0));
+        // Pure red-ish corner of the cube: index 196 → (255, 0, 0).
+        assert_eq!(xterm_256_color(196), Rgba::rgb(255, 0, 0));
+        // Last cube entry: index 231 → (255, 255, 255).
+        assert_eq!(xterm_256_color(231), Rgba::rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn xterm_256_color_grayscale_ramp() {
+        // 232 → 8; 255 → 238; linear in between.
+        assert_eq!(xterm_256_color(232), Rgba::rgb(8, 8, 8));
+        assert_eq!(xterm_256_color(255), Rgba::rgb(238, 238, 238));
     }
 }

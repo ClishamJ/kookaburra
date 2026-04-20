@@ -29,3 +29,6 @@ portable-pty = "0.8"
 # only paste text, and `image`/`tiff`/`png` transitively blow the target
 # dir past the free-disk budget on this dev machine.
 arboard = { version = "3", default-features = false }
+# Debounced file watcher for config hot-reload. `default-features` includes
+# the macOS FSEvents backend; no extra dep needed for our primary target.
+notify = "6"

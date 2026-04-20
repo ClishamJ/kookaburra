@@ -23,9 +23,18 @@ use winit::event::WindowEvent;
 use winit::window::Window;
 
 use kookaburra_core::action::Action;
+use kookaburra_core::config::Theme;
 use kookaburra_core::ids::{TileId, WorkspaceId};
 use kookaburra_core::layout::{compute_tile_rects, Rect as CoreRect};
 use kookaburra_core::state::{AppState, Workspace};
+
+/// Period in seconds between theme-swatch rotations in the bottom-right
+/// picker. 30 s is long enough that the shuffling reads as ambient
+/// decoration rather than distraction, short enough that repeated visits
+/// to the app find a fresh arrangement.
+const THEME_SWATCH_CYCLE_SECS: f64 = 30.0;
+/// Size of each color swatch in the status-bar picker.
+const SWATCH_SIZE: f32 = 14.0;
 
 /// Bytes arriving on a tile within this window treat it as "actively
 /// streaming" (the "Claude is generating" signal). Longer means the marker
@@ -338,7 +347,7 @@ impl UiLayer {
                 now,
                 squish,
             );
-            build_status_bar(ctx, state, now);
+            build_status_bar(ctx, state, actions, now);
             // `available_rect` only works inside `ctx.run`; capture the
             // central area (what's left after the strip + status bar
             // panels) so the app can size terminals into exactly this
@@ -1001,7 +1010,12 @@ fn plus_button(ui: &mut egui::Ui) -> egui::Response {
 }
 
 /// Build the status bar at the bottom of the window.
-fn build_status_bar(ctx: &egui::Context, state: &AppState, now: Instant) {
+fn build_status_bar(
+    ctx: &egui::Context,
+    state: &AppState,
+    actions: &mut Vec<Action>,
+    now: Instant,
+) {
     // Request periodic repaint for the pulsing ready dot + uptime clock.
     ctx.request_repaint_after(ANIMATION_TICK);
     egui::TopBottomPanel::bottom("kookaburra-status-bar")
@@ -1083,6 +1097,15 @@ fn build_status_bar(ctx: &egui::Context, state: &AppState, now: Instant) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
 
+                    // Theme swatches: slot 0 pinned to config default,
+                    // slots 1..N cycle every 30 s through the remaining
+                    // builtins. A workspace can pin one swatch to override
+                    // the default for that workspace only. Added first so
+                    // they land at the far-right edge of the status bar.
+                    draw_theme_swatches(ui, state, actions);
+
+                    sep(ui);
+
                     // Pulsing "● ready" indicator — gentle sine breathe
                     let t = ui.ctx().input(|i| i.time);
                     let pulse = 0.7 + 0.3 * ((t * std::f64::consts::TAU / 2.0).sin() as f32);
@@ -1126,6 +1149,197 @@ fn sep(ui: &mut egui::Ui) {
             .color(GRID_LINE)
             .font(FontId::monospace(10.0)),
     );
+}
+
+/// Translate a core `Rgba` (u8 channels) into an egui `Color32`.
+fn theme_rgba_to_color32(c: kookaburra_core::config::Rgba) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
+}
+
+/// Render the bottom-right theme swatches. Called inside a
+/// `right_to_left` layout, so widgets added first land at the right edge.
+/// To keep the visual order reading "default | a | b | c" from left to
+/// right, we iterate the logical slots in reverse.
+fn draw_theme_swatches(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
+    let default_name = state.config.theme.name.clone();
+    let all_names: Vec<&str> = Theme::builtin_names().to_vec();
+    // The pool of themes that can appear in the cycling slots: every
+    // builtin except the pinned default. With only 4 builtins today this
+    // is typically a 3-element pool.
+    let others: Vec<&str> = all_names
+        .iter()
+        .copied()
+        .filter(|n| !eq_theme_name(n, &default_name))
+        .collect();
+
+    let ws_id = state.active_workspace;
+    let active_ws = state.active_workspace();
+    let override_name = active_ws.theme_override.clone();
+
+    // How many cycling slots to show. Equal to the size of `others` (so
+    // every non-default builtin is visible simultaneously at rest).
+    let cycling_slot_count = others.len();
+
+    let time = ui.ctx().input(|i| i.time);
+    let cycle_idx = (time / THEME_SWATCH_CYCLE_SECS) as usize;
+    // Reschedule a repaint at the next 30 s boundary so swatches rotate
+    // without burning frames in between. `ANIMATION_TICK` from the rest
+    // of the status bar dominates at shorter horizons, which is fine.
+    let secs_to_next = THEME_SWATCH_CYCLE_SECS - time.rem_euclid(THEME_SWATCH_CYCLE_SECS);
+    ui.ctx()
+        .request_repaint_after(Duration::from_secs_f64(secs_to_next.max(0.05)));
+
+    // Resolve what each cycling slot will show this tick. If the
+    // workspace has an override that lives in this pool, the slot at
+    // that name's position in `others` becomes pinned; other slots skip
+    // that name when rotating so we never show the same theme twice.
+    let pinned_slot: Option<usize> = override_name
+        .as_deref()
+        .and_then(|n| others.iter().position(|o| eq_theme_name(o, n)));
+
+    // Compute the theme name for each slot (1..=N).
+    let mut slot_names: Vec<&str> = Vec::with_capacity(cycling_slot_count);
+    if let Some(pin_i) = pinned_slot {
+        let pinned_name = others[pin_i];
+        // Remaining (non-pinned) names rotate through the remaining slots.
+        let rotatable: Vec<&str> = others
+            .iter()
+            .copied()
+            .filter(|n| *n != pinned_name)
+            .collect();
+        for slot_i in 0..cycling_slot_count {
+            if slot_i == pin_i {
+                slot_names.push(pinned_name);
+            } else {
+                // Map the slot index through the rotatable pool using
+                // the cycle clock. `slot_i` itself stays stable so each
+                // slot doesn't just shift one over every cycle.
+                let j = if rotatable.is_empty() {
+                    0
+                } else {
+                    (cycle_idx + slot_i) % rotatable.len()
+                };
+                if !rotatable.is_empty() {
+                    slot_names.push(rotatable[j]);
+                } else {
+                    slot_names.push(pinned_name);
+                }
+            }
+        }
+    } else {
+        for slot_i in 0..cycling_slot_count {
+            if others.is_empty() {
+                break;
+            }
+            let j = (cycle_idx + slot_i) % others.len();
+            slot_names.push(others[j]);
+        }
+    }
+
+    // If the workspace's override isn't a builtin in our pool (e.g. a
+    // user theme), tack it on as an extra pinned slot on the right.
+    let extra_pinned: Option<&str> = override_name.as_deref().and_then(|n| {
+        if others.iter().any(|o| eq_theme_name(o, n)) {
+            None
+        } else {
+            // Only render an extra slot if the name is resolvable —
+            // otherwise the swatch would just repeat the default.
+            if Theme::builtin(n).is_some() {
+                // Leaked: store on a local via match below.
+                Some(n)
+            } else {
+                None
+            }
+        }
+    });
+
+    // Draw in reverse so "default | 1 | 2 | 3 | extra" reads correctly
+    // left-to-right under `right_to_left` layout.
+    if let Some(name) = extra_pinned {
+        draw_one_swatch(ui, name, true, ws_id, override_name.as_deref(), actions);
+    }
+    for slot_i in (0..slot_names.len()).rev() {
+        let name = slot_names[slot_i];
+        let is_pinned = pinned_slot == Some(slot_i);
+        draw_one_swatch(
+            ui,
+            name,
+            is_pinned,
+            ws_id,
+            override_name.as_deref(),
+            actions,
+        );
+    }
+    // Slot 0: always the config default, pinned when no override is set.
+    let slot0_selected = override_name.is_none();
+    draw_one_swatch(
+        ui,
+        &default_name,
+        slot0_selected,
+        ws_id,
+        override_name.as_deref(),
+        actions,
+    );
+
+    // Silence unused-variable lint when `others` is empty (1-theme pool).
+    let _ = others;
+}
+
+/// Case/space-insensitive theme-name equality, matching `Theme::builtin`.
+fn eq_theme_name(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().to_ascii_lowercase().replace(['-', '_'], " ");
+    norm(a) == norm(b)
+}
+
+/// Paint a single swatch. `selected = true` adds an accent ring and makes
+/// a click clear the override (slot 0 → clear; cycling/extra → toggle off).
+fn draw_one_swatch(
+    ui: &mut egui::Ui,
+    theme_name: &str,
+    selected: bool,
+    workspace: WorkspaceId,
+    current_override: Option<&str>,
+    actions: &mut Vec<Action>,
+) {
+    let Some(theme) = Theme::builtin(theme_name) else {
+        return;
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(SWATCH_SIZE), Sense::click());
+    let painter = ui.painter();
+    let fill = theme_rgba_to_color32(theme.background);
+    let border = theme_rgba_to_color32(theme.foreground);
+    let border = if response.hovered() {
+        // Brighten the border a touch on hover.
+        Color32::from_rgba_unmultiplied(
+            border.r().saturating_add(24),
+            border.g().saturating_add(24),
+            border.b().saturating_add(24),
+            border.a(),
+        )
+    } else {
+        border
+    };
+    painter.rect(rect, Rounding::same(2.0), fill, Stroke::new(1.0, border));
+    if selected {
+        // 1 px accent ring just outside the border.
+        let outer = rect.expand(1.5);
+        painter.rect_stroke(outer, Rounding::same(3.0), Stroke::new(1.0, ACCENT));
+    }
+    if response.clicked() {
+        // Clicking the currently-selected swatch clears the override
+        // (revert to default); clicking any other swatch pins it.
+        let next = if selected {
+            None
+        } else {
+            Some(theme_name.to_string())
+        };
+        actions.push(Action::SetWorkspaceTheme {
+            workspace,
+            theme_name: next,
+        });
+    }
+    let _ = current_override;
+    response.on_hover_text(theme_name);
 }
 
 /// Convenience: produce a `SwitchWorkspace` action. Lives here so unit

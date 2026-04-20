@@ -6,6 +6,7 @@
 pub mod action;
 pub mod config;
 pub mod ids;
+pub mod keybinding;
 pub mod layout;
 pub mod snapshot;
 pub mod state;
