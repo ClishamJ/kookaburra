@@ -352,11 +352,6 @@ pub struct Keybindings {
     pub new_workspace: String,
     pub rename_workspace: String,
     pub cycle_layout: String,
-    /// Base chord for `Cmd+Opt+N` (focus Nth tile). The `N` digit is
-    /// appended by the app. e.g. `"Cmd+Opt"` → `Cmd+Opt+1`..`Cmd+Opt+6`.
-    pub focus_tile_prefix: String,
-    /// Base chord for `Cmd+N` (switch to Nth workspace). See above.
-    pub switch_workspace_prefix: String,
 }
 
 impl Default for Keybindings {
@@ -370,8 +365,6 @@ impl Default for Keybindings {
             new_workspace: "Cmd+N".into(),
             rename_workspace: "Cmd+L".into(),
             cycle_layout: "Cmd+G".into(),
-            focus_tile_prefix: "Cmd+Opt".into(),
-            switch_workspace_prefix: "Cmd".into(),
         }
     }
 }

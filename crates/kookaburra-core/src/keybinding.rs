@@ -134,8 +134,6 @@ pub struct ResolvedKeybindings {
     pub new_workspace: Chord,
     pub rename_workspace: Chord,
     pub cycle_layout: Chord,
-    pub focus_tile_prefix: Chord,
-    pub switch_workspace_prefix: Chord,
 }
 
 impl ResolvedKeybindings {
@@ -159,16 +157,6 @@ impl ResolvedKeybindings {
                 &defaults.rename_workspace,
             ),
             cycle_layout: parse_or_default("cycle_layout", &k.cycle_layout, &defaults.cycle_layout),
-            focus_tile_prefix: parse_or_default(
-                "focus_tile_prefix",
-                &k.focus_tile_prefix,
-                &defaults.focus_tile_prefix,
-            ),
-            switch_workspace_prefix: parse_or_default(
-                "switch_workspace_prefix",
-                &k.switch_workspace_prefix,
-                &defaults.switch_workspace_prefix,
-            ),
         }
     }
 }
@@ -273,9 +261,6 @@ mod tests {
         let r = ResolvedKeybindings::default();
         assert_eq!(r.zen_mode.key, Some(ChordKey::Named(NamedChordKey::Enter)));
         assert_eq!(r.new_tile.key, Some(ChordKey::Char('t')));
-        assert!(r.focus_tile_prefix.cmd);
-        assert!(r.focus_tile_prefix.alt);
-        assert!(r.focus_tile_prefix.key.is_none());
     }
 
     #[test]

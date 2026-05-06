@@ -796,49 +796,13 @@ impl App {
 
     /// Dispatch an application-level shortcut. Bindings are pulled from
     /// `self.keybindings` (derived from `config.keybindings`) so user
-    /// config can retarget them. Prefix bindings (`focus_tile_prefix`,
-    /// `switch_workspace_prefix`) match on modifier set alone and take a
-    /// trailing digit at use site. Returns `true` when the event is
+    /// config can retarget them. Returns `true` when the event is
     /// consumed.
     fn handle_app_shortcut(&mut self, ev: &KeyEvent) -> bool {
         if ev.state != ElementState::Pressed {
             return false;
         }
 
-        let event_mods = event_modifiers(self.modifiers);
-
-        // Current digit (if any), used by the two prefix bindings.
-        let digit = match &ev.logical_key {
-            Key::Character(s) => s
-                .chars()
-                .next()
-                .and_then(|c| c.to_ascii_lowercase().to_digit(10)),
-            _ => None,
-        };
-
-        // Prefix+digit: focus N-th tile. Checked first because it includes
-        // Alt, so it never ambiguates with the Cmd-only prefix below.
-        // `!ev.repeat` so a held chord fires once, not on every OS repeat.
-        if let Some(d) = digit {
-            if d >= 1
-                && !ev.repeat
-                && self
-                    .keybindings
-                    .focus_tile_prefix
-                    .modifiers_match(&event_mods)
-            {
-                let idx = (d as usize) - 1;
-                if let Some(tile) = self.state.active_workspace().tiles.get(idx) {
-                    log::debug!("focus_tile shortcut: digit={d} mods={event_mods:?}");
-                    self.actions.push(Action::FocusTile(tile.id));
-                    return true;
-                }
-            }
-        }
-
-        // Specific bindings next (they can share the switch-workspace
-        // prefix modifiers; try them first so `Cmd+T` beats a literal
-        // `Cmd+<digit>` fall-through).
         if self.match_chord(self.keybindings.zen_mode, ev) {
             self.actions.push(Action::ToggleZenMode);
             return true;
@@ -901,31 +865,11 @@ impl App {
             return true;
         }
 
-        // Prefix+digit: switch workspace. Checked last so any specific
-        // Cmd+<char> binding above wins over Cmd+<digit> fall-through.
-        if let Some(d) = digit {
-            if d >= 1
-                && !ev.repeat
-                && self
-                    .keybindings
-                    .switch_workspace_prefix
-                    .modifiers_match(&event_mods)
-            {
-                let idx = (d as usize) - 1;
-                if let Some(ws) = self.state.workspaces.get(idx) {
-                    log::debug!("switch_workspace shortcut: digit={d} mods={event_mods:?}");
-                    self.actions.push(Action::SwitchWorkspace(ws.id));
-                    return true;
-                }
-            }
-        }
-
         false
     }
 
     /// Compare a fully-specified chord against the current event +
-    /// modifier state. Prefix chords (no terminal key) never match here —
-    /// they go through `modifiers_match` at the call sites above.
+    /// modifier state. Chords without a terminal key never match.
     fn match_chord(&self, chord: Chord, ev: &KeyEvent) -> bool {
         let Some(key) = chord.key else {
             return false;
@@ -1386,19 +1330,6 @@ fn spawn_config_watcher(proxy: EventLoopProxy<AppEvent>) -> Option<RecommendedWa
     }
     log::info!("watching {:?} for config changes", paths.config_file);
     Some(watcher)
-}
-
-/// Build a modifier-only `Chord` from a winit `ModifiersState`. Used for
-/// matching prefix bindings (e.g. `Cmd+Opt` + digit) where only the
-/// modifier set matters.
-fn event_modifiers(m: ModifiersState) -> Chord {
-    Chord {
-        cmd: m.super_key(),
-        alt: m.alt_key(),
-        shift: m.shift_key(),
-        ctrl: m.control_key(),
-        key: None,
-    }
 }
 
 /// Convert a winit KeyEvent into bytes to send to the PTY. Returns None

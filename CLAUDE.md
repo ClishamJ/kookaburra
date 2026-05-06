@@ -78,13 +78,13 @@ Checklist mirrors §8 of the spec. Tick items as they land. Sub-items that aren'
 ### Phase 2 — Multi-tile and layouts
 
 - [x] N tiles rendered from layout enum
-- [x] Focus model + keyboard focus switching (`Cmd+Opt+1..6`)
+- [x] Focus model + click-to-focus (no keyboard tile-switching — mouse-only by design)
 - [x] Per-tile PTY resize on window resize (each tile's rect → its own TIOCSWINSZ)
 - [x] Mouse click-to-focus
 - [~] Tile borders + focused-tile accent — no explicit quad border yet; focus is indicated by the `UNFOCUSED_DIM` mix on inactive tiles. A proper 1px outline needs a wgpu quad pipeline (deferred).
 - [x] Inactive tile dimming (~45% fg reduction via `UNFOCUSED_DIM`)
 - [x] Layout preset switching via keybinding (`Cmd+G` cycles 1×1 → 2×1 → 2×2 → 3×2)
-- [~] **Exit criterion:** 3×2 grid lives; click + `Cmd+Opt+N` focus works; borders not drawn, focus-via-dim stands in.
+- [~] **Exit criterion:** 3×2 grid lives; click-to-focus works (keyboard tile-switching intentionally removed); borders not drawn, focus-via-dim stands in.
 
 ### Phase 3 — Strip and workspaces
 
@@ -92,7 +92,7 @@ Checklist mirrors §8 of the spec. Tick items as they land. Sub-items that aren'
 - [x] Event routing: egui first → focused tile → terminal mouse → main loop; respect `wants_keyboard_input` / `wants_pointer_input`
 - [x] Blank `TopBottomPanel` strip (56px, logo 24×24 top-left)
 - [x] Cards (~140×48) with labels + active highlight + click-to-switch
-- [x] Multi-workspace state + `Cmd+1..9` keybinds (switch) + `Cmd+N` (new)
+- [x] Multi-workspace state + `Cmd+N` (new); workspace switching is click-only (keyboard `Cmd+1..9` intentionally removed)
 - [x] Mini tile-activity indicators on cards — tile count in corner, plus a breathing accent "unread" dot on inactive cards when any tile has `has_new_output` (alpha pulses via a 1.6 s sine)
 - [x] "Claude is generating" subtle signal on cards — three-dot accent marker in the card corner when any tile emitted bytes in the last 600 ms (rough stand-in until a Claude-specific stream detector ships)
 - [x] Workspace rename inline (double-click label, `Cmd+L`) — double-click or `Cmd+L` flips the card into a `TextEdit`; Enter commits, Esc cancels.
@@ -101,7 +101,7 @@ Checklist mirrors §8 of the spec. Tick items as they land. Sub-items that aren'
 - [x] Drag tile onto empty strip → new workspace containing that tile (`Action::MoveTileToNewWorkspace`; fires when the drag lands inside the strip but outside every card)
 - [x] `+` button to add workspace; close-workspace path (middle-click card → `Action::DeleteWorkspace`; last workspace auto-reseeds via `apply_action`)
 - [x] Horizontal scroll when strip overflows
-- [x] **Exit criterion:** strip + cards render in egui, drag-to-card, drag-to-reorder, inline rename, close-workspace, generating/activity indicators all wired; Cmd+1..9 / Cmd+N / Cmd+L shortcuts in.
+- [x] **Exit criterion:** strip + cards render in egui, drag-to-card, drag-to-reorder, inline rename, close-workspace, generating/activity indicators all wired; Cmd+N / Cmd+L shortcuts in (workspace switch is click-only).
 
 ### Phase 4 — Terminal UX essentials
 
