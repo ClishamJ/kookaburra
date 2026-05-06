@@ -158,6 +158,17 @@ pub struct Workspace {
     /// Default working directory for new tiles spawned in this workspace.
     /// `None` means "process cwd". Worktree cwd, when present, overrides.
     pub default_cwd: Option<std::path::PathBuf>,
+    /// When `true`, every `SpawnInTile` in this workspace auto-creates a
+    /// fresh git worktree of `project_repo` on a new branch (provided
+    /// `project_repo` is `Some`). The user toggles this on the workspace
+    /// card; it's the "6 worktrees per tab" mode.
+    pub worktree_mode: bool,
+    /// Cached repo root for `default_cwd`, refreshed by the app whenever
+    /// `default_cwd` changes (`SetWorkspaceCwd` triggers
+    /// `PtySideEffects::resolve_repo_root`). `None` means "default_cwd is
+    /// not inside a git repo, or default_cwd is unset" — in which case the
+    /// worktree-mode toggle is unavailable.
+    pub project_repo: Option<std::path::PathBuf>,
 }
 
 impl Workspace {
@@ -177,6 +188,8 @@ impl Workspace {
             primary_tile: None,
             theme_override: None,
             default_cwd: None,
+            worktree_mode: false,
+            project_repo: None,
         }
     }
 
@@ -345,6 +358,22 @@ impl Tile {
         self.worktree = Some(wt);
         self
     }
+
+    /// Title as drawn in the tile header. Plain shell tiles render the
+    /// shell-set title verbatim; worktree-mode tiles prefix it with a
+    /// `⎇ branch · ` marker so the branch is the first thing the user
+    /// sees. Tiles with a worktree but no shell title yet fall back to
+    /// just `⎇ branch`.
+    #[must_use]
+    pub fn display_title(&self) -> String {
+        match &self.worktree {
+            Some(wt) if !self.title.is_empty() => {
+                format!("⎇ {} · {}", wt.branch, self.title)
+            }
+            Some(wt) => format!("⎇ {}", wt.branch),
+            None => self.title.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -370,6 +399,18 @@ mod tests {
     fn workspace_new_has_no_default_cwd() {
         let ws = Workspace::new("scratch");
         assert!(ws.default_cwd.is_none());
+    }
+
+    #[test]
+    fn workspace_new_has_worktree_mode_off_by_default() {
+        let ws = Workspace::new("scratch");
+        assert!(!ws.worktree_mode);
+    }
+
+    #[test]
+    fn workspace_new_has_no_project_repo() {
+        let ws = Workspace::new("scratch");
+        assert!(ws.project_repo.is_none());
     }
 
     #[test]
@@ -472,6 +513,44 @@ mod tests {
     fn any_tile_dirty_is_false_when_workspace_is_all_empty_slots() {
         let s = AppState::new(Config::default());
         assert!(!s.any_tile_dirty(), "empty slots never have new output");
+    }
+
+    #[test]
+    fn display_title_returns_plain_title_when_no_worktree() {
+        let mut t = Tile::new(dummy_pty());
+        t.title = "vim".into();
+        assert_eq!(t.display_title(), "vim");
+    }
+
+    #[test]
+    fn display_title_returns_empty_when_no_worktree_and_no_title() {
+        let t = Tile::new(dummy_pty());
+        assert_eq!(t.display_title(), "");
+    }
+
+    #[test]
+    fn display_title_prefixes_branch_when_in_worktree_mode() {
+        let mut t = Tile::new(dummy_pty()).with_worktree(crate::worktree::Worktree {
+            source_repo: std::path::PathBuf::from("/tmp/repo"),
+            worktree_path: std::path::PathBuf::from("/tmp/wt"),
+            branch: "kookaburra/auth-3f9a".into(),
+            base_ref: "HEAD".into(),
+            status: Default::default(),
+        });
+        t.title = "claude".into();
+        assert_eq!(t.display_title(), "⎇ kookaburra/auth-3f9a · claude");
+    }
+
+    #[test]
+    fn display_title_omits_separator_when_shell_title_empty() {
+        let t = Tile::new(dummy_pty()).with_worktree(crate::worktree::Worktree {
+            source_repo: std::path::PathBuf::from("/tmp/repo"),
+            worktree_path: std::path::PathBuf::from("/tmp/wt"),
+            branch: "kookaburra/auth-3f9a".into(),
+            base_ref: "HEAD".into(),
+            status: Default::default(),
+        });
+        assert_eq!(t.display_title(), "⎇ kookaburra/auth-3f9a");
     }
 
     #[test]

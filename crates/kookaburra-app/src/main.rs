@@ -5,13 +5,15 @@
 //! renderer → PTY → `Term`. Strip, workspaces, drag-to-move and proper
 //! focus indicators come in later phases.
 
+mod git;
 mod particles;
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kookaburra_core::action::{apply_action, Action, PtySideEffects};
+use kookaburra_core::action::{apply_action, Action, PtySideEffects, SpawnResult};
 use kookaburra_core::config::Config;
 use kookaburra_core::ids::{PtyId, TileId};
 use kookaburra_core::keybinding::{Chord, ChordKey, NamedChordKey, ResolvedKeybindings};
@@ -94,6 +96,11 @@ impl PtyEventSink for WinitSink {
     }
 }
 
+/// Default branch-name template for auto-generated worktree branches:
+/// `kookaburra/<workspace-slug>-<short_id>`. Lives here (rather than as a
+/// `const` in `git.rs`) so a future config knob can override it.
+const DEFAULT_BRANCH_TEMPLATE: &str = "kookaburra/{}-{}";
+
 /// Adapter so `kookaburra-core::apply_action` can ask our `PtyManager`
 /// to spawn and close PTYs without `core` depending on `pty`.
 struct PtyAdapter<'a> {
@@ -101,11 +108,12 @@ struct PtyAdapter<'a> {
     default_size: PtySize,
 }
 
-impl<'a> PtySideEffects for PtyAdapter<'a> {
-    fn spawn(&mut self, tile_id: TileId, _worktree: Option<&WorktreeConfig>) -> PtyId {
+impl<'a> PtyAdapter<'a> {
+    fn run_spawn(&mut self, tile_id: TileId, cwd: Option<PathBuf>) -> PtyId {
         let req = SpawnRequest {
             tile_id,
             size: self.default_size,
+            cwd,
             ..SpawnRequest::default()
         };
         match self.manager.spawn(req) {
@@ -116,9 +124,56 @@ impl<'a> PtySideEffects for PtyAdapter<'a> {
             }
         }
     }
+}
+
+impl<'a> PtySideEffects for PtyAdapter<'a> {
+    fn spawn(
+        &mut self,
+        tile_id: TileId,
+        cwd: Option<&Path>,
+        worktree: Option<&WorktreeConfig>,
+    ) -> SpawnResult {
+        // Plain shell path: no worktree requested. CWD comes from the
+        // workspace's default_cwd (passed in by apply_action).
+        let Some(cfg) = worktree else {
+            let pty_id = self.run_spawn(tile_id, cwd.map(PathBuf::from));
+            return SpawnResult {
+                pty_id,
+                worktree: None,
+            };
+        };
+
+        // Worktree path: shell out to `git worktree add`, then spawn the
+        // PTY with cwd set to the freshly created worktree directory.
+        let base_dir = git::default_worktrees_dir();
+        match git::create_worktree(cfg, &base_dir, DEFAULT_BRANCH_TEMPLATE) {
+            Ok(wt) => {
+                let pty_id = self.run_spawn(tile_id, Some(wt.worktree_path.clone()));
+                SpawnResult {
+                    pty_id,
+                    worktree: Some(wt),
+                }
+            }
+            Err(e) => {
+                // Fall back to a plain shell rooted at the workspace cwd
+                // so the user still gets a tile. The error is logged so
+                // the user can see why their worktree didn't materialize.
+                log::error!("worktree create failed: {e}; falling back to plain shell");
+                let pty_id = self.run_spawn(tile_id, cwd.map(PathBuf::from));
+                SpawnResult {
+                    pty_id,
+                    worktree: None,
+                }
+            }
+        }
+    }
 
     fn close(&mut self, pty: PtyId) {
         self.manager.close(pty);
+    }
+
+    fn resolve_repo_root(&self, cwd: &Path) -> Option<PathBuf> {
+        git::resolve_repo_root(cwd)
     }
 }
 
@@ -512,7 +567,7 @@ impl App {
                     tile.pty_id.map(|pty_id| {
                         let mut snap = TileSnapshot::new(tile.id);
                         self.pty_manager.snapshot(pty_id, &theme, &mut snap);
-                        snap.title = tile.title.clone();
+                        snap.title = tile.display_title();
                         snap
                     })
                 } else {
@@ -574,7 +629,7 @@ impl App {
                     RenderTileSeed {
                         tile_id: t.id,
                         pty_id: t.pty_id,
-                        title: t.title.clone(),
+                        title: t.display_title(),
                         generating,
                         primary: is_primary,
                         follow_mode: t.follow_mode,
@@ -799,7 +854,11 @@ impl App {
     /// config can retarget them. Returns `true` when the event is
     /// consumed.
     fn handle_app_shortcut(&mut self, ev: &KeyEvent) -> bool {
-        if ev.state != ElementState::Pressed {
+        // Auto-repeat must not refire shortcuts: holding Cmd+N shouldn't
+        // create a flurry of workspaces, holding Cmd+W shouldn't close
+        // tile after tile, and a stale-Cmd race would otherwise multiply
+        // by every OS repeat tick.
+        if ev.state != ElementState::Pressed || ev.repeat {
             return false;
         }
 
@@ -842,10 +901,11 @@ impl App {
             return true;
         }
         if self.match_chord(self.keybindings.rename_workspace, ev) {
-            let ws_id = self.state.active_workspace;
-            let label = self.state.active_workspace().label.clone();
+            // Clone the active workspace so we can hand a borrow to the
+            // UI layer without aliasing &mut self.
+            let ws = self.state.active_workspace().clone();
             if let Some(ui) = self.ui.as_mut() {
-                ui.start_rename(ws_id, label);
+                ui.start_rename(&ws);
             }
             self.state.request_redraw();
             return true;
@@ -1113,6 +1173,14 @@ impl ApplicationHandler<AppEvent> for App {
                 self.dragging_tile = None;
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
+                // Self-correct stale `Cmd` before any chord matching. macOS
+                // drops modifier-up events when focus passes through
+                // overlays that don't fire `Focused(_)` (Spotlight, menu
+                // dropdowns, Notification Center, Mission Control). The
+                // next keystroke would otherwise match a `Cmd+letter`
+                // chord — most painfully `Cmd+N` → `CreateWorkspace`,
+                // throwing the user to a new workspace mid-word.
+                maybe_clear_stale_super(&mut self.modifiers, key.state, key.text.as_deref());
                 if self.handle_app_shortcut(&key) {
                     return;
                 }
@@ -1332,6 +1400,28 @@ fn spawn_config_watcher(proxy: EventLoopProxy<AppEvent>) -> Option<RecommendedWa
     Some(watcher)
 }
 
+/// Self-correct `self.modifiers` against a keystroke's text payload. On
+/// macOS, `Cmd` always suppresses text generation, so a non-empty `text`
+/// is hard proof that Cmd is *not* held — even if `ModifiersChanged` was
+/// lost while focus passed through Spotlight, a menu dropdown,
+/// Notification Center, Mission Control, or any overlay that doesn't
+/// fire `WindowEvent::Focused`. Without this, a stale `SUPER` bit makes
+/// the next letter the user types fire a `Cmd+letter` chord (most
+/// painfully `Cmd+N` → `CreateWorkspace`).
+///
+/// Only `SUPER` is scrubbed: `Opt+letter` produces accented text and
+/// `Ctrl+letter` produces a control byte, so `text=Some(_)` does not
+/// prove `ALT` or `CTRL` is released.
+///
+/// Field-shaped (not `&KeyEvent`) so it's unit-testable —
+/// `winit::event::KeyEvent::platform_specific` is `pub(crate)` and can't
+/// be constructed outside winit.
+fn maybe_clear_stale_super(mods: &mut ModifiersState, state: ElementState, text: Option<&str>) {
+    if state == ElementState::Pressed && text.is_some_and(|t| !t.is_empty()) {
+        mods.remove(ModifiersState::SUPER);
+    }
+}
+
 /// Convert a winit KeyEvent into bytes to send to the PTY. Returns None
 /// if the event produces no PTY input (e.g. pressing a modifier alone).
 fn key_event_to_bytes(ev: &KeyEvent, mods: ModifiersState) -> Option<Vec<u8>> {
@@ -1407,5 +1497,49 @@ fn named_key_bytes(key: NamedKey, mods: ModifiersState) -> &'static [u8] {
         NamedKey::F11 => b"\x1b[23~",
         NamedKey::F12 => b"\x1b[24~",
         _ => b"",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clears_super_on_pressed_with_text() {
+        let mut m = ModifiersState::SUPER | ModifiersState::ALT;
+        maybe_clear_stale_super(&mut m, ElementState::Pressed, Some("n"));
+        assert!(
+            !m.super_key(),
+            "SUPER must be cleared when text is produced"
+        );
+        assert!(m.alt_key(), "ALT must be preserved");
+    }
+
+    #[test]
+    fn preserves_super_on_pressed_with_no_text() {
+        // Genuine Cmd+N path: macOS reports text=None when Cmd is really
+        // held, so we mustn't scrub it.
+        let mut m = ModifiersState::SUPER;
+        maybe_clear_stale_super(&mut m, ElementState::Pressed, None);
+        assert!(
+            m.super_key(),
+            "SUPER must survive when no text was produced"
+        );
+    }
+
+    #[test]
+    fn preserves_super_on_pressed_with_empty_text() {
+        let mut m = ModifiersState::SUPER;
+        maybe_clear_stale_super(&mut m, ElementState::Pressed, Some(""));
+        assert!(m.super_key());
+    }
+
+    #[test]
+    fn preserves_super_on_release() {
+        // Releases can carry text on some platforms; we only correct on
+        // press so the press-side scrub is the single source of truth.
+        let mut m = ModifiersState::SUPER;
+        maybe_clear_stale_super(&mut m, ElementState::Released, Some("n"));
+        assert!(m.super_key());
     }
 }

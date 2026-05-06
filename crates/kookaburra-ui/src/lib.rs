@@ -119,13 +119,47 @@ pub struct PreparedFrame {
     pub repaint_delay: Duration,
 }
 
-/// Ephemeral state for the inline rename editor. Lives on `UiLayer`
+/// Ephemeral state for the inline workspace editor. Lives on `UiLayer`
 /// rather than `AppState` because it's a pure UI concern — the canonical
-/// label only updates when the user commits with Enter.
+/// fields only update when the user commits.
+///
+/// Despite the historical name, this editor now also covers `default_cwd`
+/// and the worktree-mode toggle. We keep the type name to avoid churning
+/// callers; rename if/when the UI grows further.
 struct RenameState {
     id: WorkspaceId,
-    buffer: String,
+    label_buffer: String,
+    cwd_buffer: String,
+    worktree_mode_buffer: bool,
+    /// True when the workspace currently has a detected git repo. Drives
+    /// whether the worktree-mode toggle is interactable; false → the
+    /// toggle renders disabled with an explanatory tooltip.
+    repo_available: bool,
+    original_label: String,
+    original_cwd: Option<std::path::PathBuf>,
+    original_worktree_mode: bool,
     focus_requested: bool,
+}
+
+impl RenameState {
+    fn for_workspace(ws: &Workspace) -> Self {
+        let cwd_str = ws
+            .default_cwd
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Self {
+            id: ws.id,
+            label_buffer: ws.label.clone(),
+            cwd_buffer: cwd_str,
+            worktree_mode_buffer: ws.worktree_mode,
+            repo_available: ws.project_repo.is_some(),
+            original_label: ws.label.clone(),
+            original_cwd: ws.default_cwd.clone(),
+            original_worktree_mode: ws.worktree_mode,
+            focus_requested: false,
+        }
+    }
 }
 
 /// Ephemeral state for drag-to-reorder. We only track the source card —
@@ -244,14 +278,12 @@ impl UiLayer {
         self.ctx.set_pixels_per_point(scale_factor);
     }
 
-    /// Open the inline rename editor for a workspace card. Used by the
+    /// Open the inline workspace editor for a workspace card. Used by the
     /// `Cmd+L` keybinding; double-click is handled inside `build_strip`.
-    pub fn start_rename(&mut self, id: WorkspaceId, initial: String) {
-        self.renaming = Some(RenameState {
-            id,
-            buffer: initial,
-            focus_requested: false,
-        });
+    /// The editor seeds itself from `ws` (label, default_cwd,
+    /// worktree_mode, repo availability).
+    pub fn start_rename(&mut self, ws: &Workspace) {
+        self.renaming = Some(RenameState::for_workspace(ws));
     }
 
     /// Which workspace card (if any) is under the given logical-pixel
@@ -537,6 +569,7 @@ fn draw_workspace_slot(
         dragging_this,
         squish_elapsed,
         time_secs,
+        ws.worktree_mode,
     );
     // Drag start: plain left-drag on a card. Use this to reorder, not
     // to switch.
@@ -557,11 +590,7 @@ fn draw_workspace_slot(
     // and the editor opens on the second click — a small, acceptable
     // flicker.
     if resp.double_clicked() {
-        *renaming = Some(RenameState {
-            id: ws.id,
-            buffer: ws.label.clone(),
-            focus_requested: false,
-        });
+        *renaming = Some(RenameState::for_workspace(ws));
     }
     let animating = show_activity_dot || signals.generating || squish_elapsed.is_some();
     (resp.rect, animating)
@@ -573,52 +602,158 @@ fn draw_rename_editor(
     actions: &mut Vec<Action>,
     renaming: &mut Option<RenameState>,
 ) -> egui::Rect {
-    let size = Vec2::new(CARD_WIDTH, CARD_HEIGHT);
+    // Reserve the same card-sized slot in the strip so the surrounding
+    // layout doesn't reflow while the editor is open. We paint a muted
+    // placeholder ("editing…") here; the actual fields live in a floating
+    // popup just below the strip.
+    let (slot_rect, _slot_resp) =
+        ui.allocate_exact_size(Vec2::new(CARD_WIDTH, CARD_HEIGHT), Sense::hover());
+    let painter = ui.painter();
+    painter.rect(slot_rect, Rounding::ZERO, BG_DIM, Stroke::new(1.5, ACCENT));
+    painter.text(
+        slot_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "editing…",
+        FontId::proportional(11.0),
+        FG_DIM,
+    );
+
+    // ----- Floating popup with the 3 fields -----
+    // Pulled into its own scope so we can early-return rect cleanly and
+    // keep all the state-mutating code colocated.
+    let popup_pos = egui::pos2(slot_rect.left(), slot_rect.bottom() + 6.0);
+    let popup_rect = egui::Area::new(egui::Id::new(("ws-edit-popup", id)))
+        .order(egui::Order::Foreground)
+        .fixed_pos(popup_pos)
+        .show(ui.ctx(), |ui| {
+            Frame::none()
+                .fill(STRIP_BG)
+                .stroke(Stroke::new(1.0, ACCENT))
+                .rounding(Rounding::same(2.0))
+                .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                .show(ui, |ui| {
+                    ui.set_min_width(280.0);
+                    ui.spacing_mut().item_spacing = Vec2::new(4.0, 6.0);
+                    draw_editor_body(ui, id, actions, renaming);
+                });
+        })
+        .response
+        .rect;
+
+    // Dismiss-on-escape regardless of which field has focus. Commit
+    // logic lives inside `draw_editor_body` so it has access to the
+    // mutable buffers.
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        *renaming = None;
+    }
+
+    // Return the strip slot's rect so card_rects records the right hit
+    // target. The popup is decoration that sits outside the strip.
+    let _ = popup_rect;
+    slot_rect
+}
+
+fn draw_editor_body(
+    ui: &mut egui::Ui,
+    id: WorkspaceId,
+    actions: &mut Vec<Action>,
+    renaming: &mut Option<RenameState>,
+) {
     let r = renaming
         .as_mut()
-        .expect("draw_rename_editor only called when renaming is Some");
-    let edit = egui::TextEdit::singleline(&mut r.buffer)
-        .desired_width(CARD_WIDTH - 12.0)
-        .text_color(FG)
-        .font(FontId::proportional(13.0))
-        .frame(false);
-    let frame = Frame::none()
-        .fill(BG_DIM)
-        .stroke(Stroke::new(1.5, ACCENT))
-        .rounding(Rounding::ZERO)
-        .inner_margin(egui::Margin::symmetric(6.0, 8.0));
-    let response = frame
-        .show(ui, |ui| {
-            ui.allocate_ui_with_layout(
-                size,
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| ui.add(edit),
-            )
-            .inner
-        })
-        .inner;
+        .expect("draw_editor_body only called when renaming is Some");
 
-    // Focus the field on first draw so the user can start typing.
+    // ---- Label row ----
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("name").color(FG_DIM).size(10.0));
+    });
+    let label_edit = egui::TextEdit::singleline(&mut r.label_buffer)
+        .desired_width(260.0)
+        .hint_text("workspace name")
+        .text_color(FG)
+        .font(FontId::proportional(13.0));
+    let label_resp = ui.add(label_edit);
+
+    // ---- CWD row ----
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("project path").color(FG_DIM).size(10.0));
+    });
+    let cwd_edit = egui::TextEdit::singleline(&mut r.cwd_buffer)
+        .desired_width(260.0)
+        .hint_text("e.g. ~/projects/foo")
+        .text_color(FG)
+        .font(FontId::proportional(12.0));
+    let cwd_resp = ui.add(cwd_edit);
+
+    // ---- Worktree-mode toggle ----
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        let enabled = r.repo_available;
+        let label_color = if enabled { FG } else { FG_DIM };
+        let toggle = ui.add_enabled(
+            enabled,
+            egui::Checkbox::new(
+                &mut r.worktree_mode_buffer,
+                egui::RichText::new("worktree mode (each tile = its own worktree)")
+                    .color(label_color)
+                    .size(11.0),
+            ),
+        );
+        if !enabled {
+            toggle.on_hover_text(
+                "Set a project path that's inside a git repo to enable worktree mode.",
+            );
+        }
+    });
+
+    // Focus the label field on first draw.
     if !r.focus_requested {
-        response.request_focus();
+        label_resp.request_focus();
         r.focus_requested = true;
     }
 
+    // Tab navigates label → cwd. Shift+Tab reverses. egui's default
+    // focus traversal handles this since both TextEdits are added in
+    // sequence; nothing extra to wire up.
+
+    // Commit when Enter is pressed in any field, or when the popup
+    // loses focus to a click outside (lost_focus on the active widget
+    // without Escape having been pressed).
     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
     let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-    let lost_focus = response.lost_focus();
+    if escape {
+        // Esc handled at the outer level too, but check here to avoid
+        // double-emit on the same frame.
+        return;
+    }
+    let any_lost_focus = label_resp.lost_focus() || cwd_resp.lost_focus();
+    if enter || any_lost_focus {
+        // Snapshot original values before we drop `r`.
+        let new_label = r.label_buffer.trim().to_string();
+        let original_label = r.original_label.clone();
+        let new_cwd = expand_cwd_input(
+            &r.cwd_buffer,
+            std::env::var("HOME")
+                .ok()
+                .as_deref()
+                .map(std::path::Path::new),
+        );
+        let original_cwd = r.original_cwd.clone();
+        let new_mode = r.worktree_mode_buffer && r.repo_available;
+        let original_mode = r.original_worktree_mode;
 
-    let rect = response.rect;
-    if enter || (lost_focus && !escape) {
-        let new_label = r.buffer.trim().to_string();
-        if !new_label.is_empty() {
+        // Emit only the actions whose values actually changed.
+        if !new_label.is_empty() && new_label != original_label {
             actions.push(Action::RenameWorkspace { id, new_label });
         }
-        *renaming = None;
-    } else if escape {
+        if new_cwd != original_cwd {
+            actions.push(Action::SetWorkspaceCwd { id, cwd: new_cwd });
+        }
+        if new_mode != original_mode {
+            actions.push(Action::SetWorktreeMode { id, on: new_mode });
+        }
         *renaming = None;
     }
-    rect
 }
 
 /// Parsed pixel-art kookaburra logo. Each tuple is an `(x, y)` cell on the
@@ -666,6 +801,28 @@ fn logo_pixels() -> &'static LogoPixels {
     })
 }
 
+/// Convert a user-typed path string into an `Option<PathBuf>`.
+///
+/// - Empty / whitespace-only input → `None` (cwd cleared).
+/// - Leading `~` or `~/...` is expanded against `home_dir` when supplied.
+///   `~userfoo` (no slash) is taken literally — matches shell behavior.
+/// - Anything else is taken as-is, after trimming.
+fn expand_cwd_input(input: &str, home_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(home) = home_dir {
+        if trimmed == "~" {
+            return Some(home.to_path_buf());
+        }
+        if let Some(rest) = trimmed.strip_prefix("~/") {
+            return Some(home.join(rest));
+        }
+    }
+    Some(std::path::PathBuf::from(trimmed))
+}
+
 fn attr_u16(s: &str, key: &str) -> Option<u16> {
     let start = s.find(key)? + key.len();
     let rest = &s[start..];
@@ -708,8 +865,8 @@ fn logo_placeholder(ui: &mut egui::Ui) {
 
     // Top-left of the bird's bounding box, centered inside `rect` and
     // snapped to the pixel grid so the 1×1 cells stay crisp.
-    let origin = rect.center() - Vec2::new(bird_w, bird_h) * 0.5
-        + Vec2::new(peck_dx, bob + peck_dy);
+    let origin =
+        rect.center() - Vec2::new(bird_w, bird_h) * 0.5 + Vec2::new(peck_dx, bob + peck_dy);
     let origin = egui::pos2(origin.x.round(), origin.y.round());
 
     for &(cx, cy) in &pixels.cells {
@@ -733,6 +890,7 @@ fn draw_card(
     dragging: bool,
     squish_elapsed: Option<f32>,
     time_secs: f64,
+    worktree_mode: bool,
 ) -> egui::Response {
     // koo-ws-squish: a gentle press-in-and-release on workspace switch.
     // Both axes start at SQUISH_START_SCALE and ease up to 1.0 with a
@@ -901,6 +1059,26 @@ fn draw_card(
             painter.rect_filled(dot_rect, Rounding::ZERO, dot_color);
         }
     }
+    // Worktree-mode marker — small `⎇` glyph in the top-left corner so the
+    // user can spot at a glance which workspaces auto-spawn worktrees.
+    // Painted in TEAL (the worktree accent color from this module's
+    // palette) so it reads distinct from the amber active-accent.
+    if worktree_mode {
+        let pos = response.rect.left_top() + Vec2::new(4.0, 2.0);
+        let marker_color = if active {
+            TEAL
+        } else {
+            TEAL.gamma_multiply(0.7)
+        };
+        painter.text(
+            pos,
+            egui::Align2::LEFT_TOP,
+            "⎇",
+            FontId::proportional(11.0),
+            marker_color,
+        );
+    }
+
     // Layout chip — bottom-left corner, showing "2x2" etc. like the design.
     {
         let chip_text = layout_label;
@@ -1580,6 +1758,52 @@ mod tests {
     use super::*;
     use kookaburra_core::ids::PtyId;
     use kookaburra_core::state::Tile;
+    use std::path::Path;
+
+    #[test]
+    fn expand_cwd_empty_input_returns_none() {
+        assert!(expand_cwd_input("", Some(Path::new("/home/me"))).is_none());
+        assert!(expand_cwd_input("   ", Some(Path::new("/home/me"))).is_none());
+        assert!(expand_cwd_input("\t\n", None).is_none());
+    }
+
+    #[test]
+    fn expand_cwd_absolute_path_passes_through() {
+        let p = expand_cwd_input("/var/log", Some(Path::new("/home/me"))).unwrap();
+        assert_eq!(p, std::path::PathBuf::from("/var/log"));
+    }
+
+    #[test]
+    fn expand_cwd_lone_tilde_expands_to_home() {
+        let p = expand_cwd_input("~", Some(Path::new("/home/me"))).unwrap();
+        assert_eq!(p, std::path::PathBuf::from("/home/me"));
+    }
+
+    #[test]
+    fn expand_cwd_tilde_slash_path_expands_under_home() {
+        let p = expand_cwd_input("~/projects/foo", Some(Path::new("/home/me"))).unwrap();
+        assert_eq!(p, std::path::PathBuf::from("/home/me/projects/foo"));
+    }
+
+    #[test]
+    fn expand_cwd_tilde_without_slash_is_taken_literally() {
+        // `~userfoo` is not a tilde-expand pattern (no slash), so the
+        // shell would also leave it alone — keep our behavior consistent.
+        let p = expand_cwd_input("~userfoo", Some(Path::new("/home/me"))).unwrap();
+        assert_eq!(p, std::path::PathBuf::from("~userfoo"));
+    }
+
+    #[test]
+    fn expand_cwd_no_home_keeps_tilde_literal() {
+        let p = expand_cwd_input("~/foo", None).unwrap();
+        assert_eq!(p, std::path::PathBuf::from("~/foo"));
+    }
+
+    #[test]
+    fn expand_cwd_trims_surrounding_whitespace() {
+        let p = expand_cwd_input("  /abs/path  ", None).unwrap();
+        assert_eq!(p, std::path::PathBuf::from("/abs/path"));
+    }
 
     #[test]
     fn switch_workspace_action_wraps_id() {

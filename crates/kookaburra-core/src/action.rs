@@ -10,10 +10,12 @@
 //! not need to depend on `kookaburra-pty`. The `app` crate wires the real
 //! PTY manager as the implementer.
 
+use std::path::{Path, PathBuf};
+
 use crate::ids::{PtyId, TileId, WorkspaceId};
 use crate::layout::Layout;
 use crate::state::{AppState, Tile, Workspace};
-use crate::worktree::WorktreeConfig;
+use crate::worktree::{Worktree, WorktreeConfig};
 
 /// Search scope for the search dialogs.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -87,6 +89,35 @@ pub enum Action {
         workspace: WorkspaceId,
         theme_name: Option<String>,
     },
+    /// Set or clear the per-workspace default cwd. New tiles spawned in
+    /// this workspace start in this directory unless a worktree path
+    /// overrides it. The app layer is expected to refresh
+    /// `Workspace::project_repo` after this lands by calling
+    /// `PtySideEffects::resolve_repo_root`.
+    SetWorkspaceCwd {
+        id: WorkspaceId,
+        cwd: Option<PathBuf>,
+    },
+    /// Toggle workspace-wide worktree mode. While `on`, every
+    /// `SpawnInTile` in this workspace auto-creates a fresh git worktree
+    /// of the workspace's `project_repo` on a new branch.
+    SetWorktreeMode {
+        id: WorkspaceId,
+        on: bool,
+    },
+}
+
+/// Result of a [`PtySideEffects::spawn`] call.
+///
+/// `worktree` is `Some` only when a worktree was actually created (i.e. the
+/// caller supplied a `WorktreeConfig` *and* `git worktree add` succeeded).
+/// `apply_action` stores it on the freshly-promoted [`Tile`] so the UI can
+/// surface the branch name and so the close-tile path knows the worktree
+/// exists.
+#[derive(Clone, Debug)]
+pub struct SpawnResult {
+    pub pty_id: PtyId,
+    pub worktree: Option<Worktree>,
 }
 
 /// Side effects the action handler may need to ask the PTY layer to
@@ -96,14 +127,27 @@ pub enum Action {
 /// alacritty_terminal and lets us unit-test `apply_action` against a
 /// stub.
 pub trait PtySideEffects {
-    /// Spawn a new PTY bound to `tile_id` and return its id. The `tile_id`
-    /// is decided by `apply_action` before this call so the PTY's event
-    /// listener can tag events with the same id the `Tile` will carry.
-    /// The implementation chooses CWD and shell from the worktree config +
-    /// app defaults.
-    fn spawn(&mut self, tile_id: TileId, worktree: Option<&WorktreeConfig>) -> PtyId;
+    /// Spawn a new PTY bound to `tile_id`. The `tile_id` is decided by
+    /// `apply_action` before this call so the PTY's event listener can
+    /// tag events with the same id the `Tile` will carry.
+    ///
+    /// `cwd` is the workspace's default cwd (overridden by the worktree
+    /// path when one is created). `worktree` is `Some` only when the
+    /// caller wants a fresh git worktree created — the implementation is
+    /// expected to shell out to `git worktree add`, then spawn the PTY
+    /// with cwd set to the worktree path.
+    fn spawn(
+        &mut self,
+        tile_id: TileId,
+        cwd: Option<&Path>,
+        worktree: Option<&WorktreeConfig>,
+    ) -> SpawnResult;
     /// Close a PTY. Best-effort; failures should be logged, not returned.
     fn close(&mut self, pty: PtyId);
+    /// Resolve the git repo root that `cwd` lives inside, if any. Returns
+    /// `None` when `cwd` isn't inside a repo. Used by `SetWorkspaceCwd` to
+    /// refresh `Workspace::project_repo`.
+    fn resolve_repo_root(&self, cwd: &Path) -> Option<PathBuf>;
 }
 
 /// Locate a tile across all workspaces by its id. Returns
@@ -189,13 +233,42 @@ pub fn apply_action(state: &mut AppState, pty: &mut dyn PtySideEffects, action: 
             // Promote an empty slot to live. No-op if the tile doesn't
             // resolve or the slot is already live.
             let is_empty_slot = state.tile(tile_id).map(|t| !t.is_live()).unwrap_or(false);
-            if is_empty_slot {
-                let pty_id = pty.spawn(tile_id, worktree.as_ref());
-                if let Some(tile) = state.tile_mut(tile_id) {
-                    tile.promote(pty_id);
-                }
-                state.focused_tile = Some(tile_id);
+            if !is_empty_slot {
+                return;
             }
+            // Resolve the owning workspace once: we need the cwd, the
+            // worktree-mode flag, the project_repo, and the label.
+            let owning = state
+                .workspaces
+                .iter()
+                .find(|w| w.tiles.iter().any(|t| t.id == tile_id));
+            let cwd: Option<PathBuf> = owning.and_then(|w| w.default_cwd.clone());
+            // Auto-generate a WorktreeConfig from workspace state when:
+            // - no explicit one was supplied,
+            // - the workspace is in worktree mode, and
+            // - it has a detected project repo to branch from.
+            // Otherwise pass the explicit config (or None) through.
+            let effective_worktree = match worktree {
+                Some(cfg) => Some(cfg),
+                None => owning.and_then(|w| {
+                    if w.worktree_mode {
+                        w.project_repo.as_ref().map(|repo| WorktreeConfig {
+                            source_repo: repo.clone(),
+                            branch: None,
+                            base_ref: None,
+                            label_hint: w.label.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                }),
+            };
+            let result = pty.spawn(tile_id, cwd.as_deref(), effective_worktree.as_ref());
+            if let Some(tile) = state.tile_mut(tile_id) {
+                tile.promote(result.pty_id);
+                tile.worktree = result.worktree;
+            }
+            state.focused_tile = Some(tile_id);
         }
         Action::CloseTile(tile_id) => {
             // Demote a live slot back to empty. The slot itself stays —
@@ -322,6 +395,33 @@ pub fn apply_action(state: &mut AppState, pty: &mut dyn PtySideEffects, action: 
                 ws.theme_override = theme_name;
             }
         }
+        Action::SetWorkspaceCwd { id, cwd } => {
+            // Refresh the cached project_repo via the side-effects trait
+            // so the UI can decide whether to enable the worktree-mode
+            // toggle. Done before the assignment so a None cwd clears
+            // both fields atomically.
+            let new_repo = cwd.as_deref().and_then(|p| pty.resolve_repo_root(p));
+            if let Some(ws) = state.workspace_mut(id) {
+                ws.default_cwd = cwd;
+                ws.project_repo = new_repo;
+                if ws.project_repo.is_none() {
+                    // Worktree mode requires a repo. Clear the flag so the
+                    // UI doesn't render a "mode on, but greyed out" oddity.
+                    ws.worktree_mode = false;
+                }
+            }
+        }
+        Action::SetWorktreeMode { id, on } => {
+            if let Some(ws) = state.workspace_mut(id) {
+                // Refuse to enable when the workspace has no detected
+                // repo. The UI is expected to disable the toggle in that
+                // case anyway; this is a guardrail against stale state.
+                if on && ws.project_repo.is_none() {
+                    return;
+                }
+                ws.worktree_mode = on;
+            }
+        }
     }
 }
 
@@ -336,16 +436,37 @@ mod tests {
         spawns: u32,
         closes: u32,
         last_spawn_tile: Option<TileId>,
+        last_spawn_cwd: Option<PathBuf>,
+        last_spawn_worktree_config: Option<WorktreeConfig>,
+        /// When `Some`, the next `spawn` returns this `Worktree` in its
+        /// `SpawnResult`. Drained on use so tests can seed one return.
+        next_spawn_worktree: Option<Worktree>,
+        /// When `Some`, `resolve_repo_root` always returns this. Otherwise
+        /// returns `None`.
+        repo_root_for_next_lookup: Option<PathBuf>,
     }
 
     impl PtySideEffects for StubPty {
-        fn spawn(&mut self, tile_id: TileId, _worktree: Option<&WorktreeConfig>) -> PtyId {
+        fn spawn(
+            &mut self,
+            tile_id: TileId,
+            cwd: Option<&Path>,
+            worktree: Option<&WorktreeConfig>,
+        ) -> SpawnResult {
             self.spawns += 1;
             self.last_spawn_tile = Some(tile_id);
-            PtyId::new()
+            self.last_spawn_cwd = cwd.map(PathBuf::from);
+            self.last_spawn_worktree_config = worktree.cloned();
+            SpawnResult {
+                pty_id: PtyId::new(),
+                worktree: self.next_spawn_worktree.take(),
+            }
         }
         fn close(&mut self, _pty: PtyId) {
             self.closes += 1;
+        }
+        fn resolve_repo_root(&self, _cwd: &Path) -> Option<PathBuf> {
+            self.repo_root_for_next_lookup.clone()
         }
     }
 
@@ -794,6 +915,411 @@ mod tests {
             },
         );
         assert!(state.workspace(ws_id).unwrap().theme_override.is_none());
+    }
+
+    #[test]
+    fn set_workspace_cwd_assigns_path() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let ws_id = state.active_workspace;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SetWorkspaceCwd {
+                id: ws_id,
+                cwd: Some(std::path::PathBuf::from("/tmp/projects/foo")),
+            },
+        );
+        assert_eq!(
+            state.workspace(ws_id).unwrap().default_cwd.as_deref(),
+            Some(std::path::Path::new("/tmp/projects/foo"))
+        );
+    }
+
+    #[test]
+    fn set_workspace_cwd_clears_with_none() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let ws_id = state.active_workspace;
+        state.workspace_mut(ws_id).unwrap().default_cwd =
+            Some(std::path::PathBuf::from("/tmp/will-be-cleared"));
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SetWorkspaceCwd {
+                id: ws_id,
+                cwd: None,
+            },
+        );
+        assert!(state.workspace(ws_id).unwrap().default_cwd.is_none());
+    }
+
+    #[test]
+    fn set_workspace_cwd_unknown_id_is_noop() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SetWorkspaceCwd {
+                id: WorkspaceId::new(),
+                cwd: Some(std::path::PathBuf::from("/tmp/anywhere")),
+            },
+        );
+        assert!(state.active_workspace().default_cwd.is_none());
+    }
+
+    #[test]
+    fn spawn_in_tile_passes_workspace_default_cwd_to_pty() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let ws_id = state.active_workspace;
+        let tile_id = state.active_workspace().tiles[0].id;
+        let project_path = std::path::PathBuf::from("/tmp/projects/foo");
+        state.workspace_mut(ws_id).unwrap().default_cwd = Some(project_path.clone());
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SpawnInTile {
+                tile_id,
+                worktree: None,
+            },
+        );
+        assert_eq!(pty.last_spawn_cwd.as_deref(), Some(project_path.as_path()));
+    }
+
+    #[test]
+    fn spawn_in_tile_passes_none_cwd_when_workspace_has_no_default() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let tile_id = state.active_workspace().tiles[0].id;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SpawnInTile {
+                tile_id,
+                worktree: None,
+            },
+        );
+        assert!(pty.last_spawn_cwd.is_none());
+    }
+
+    #[test]
+    fn spawn_in_tile_auto_builds_worktree_config_when_workspace_in_worktree_mode() {
+        // 6-worktrees-per-tab: the user toggled `worktree_mode` on the
+        // workspace; every SpawnInTile (no explicit config) should fan out
+        // a fresh WorktreeConfig to the PTY layer derived from the
+        // workspace's project_repo + label.
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let ws_id = state.active_workspace;
+        {
+            let ws = state.workspace_mut(ws_id).unwrap();
+            ws.label = "Auth Refactor".into();
+            ws.project_repo = Some(PathBuf::from("/tmp/repo"));
+            ws.worktree_mode = true;
+        }
+        let tile_id = state.active_workspace().tiles[0].id;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SpawnInTile {
+                tile_id,
+                worktree: None,
+            },
+        );
+        let cfg = pty
+            .last_spawn_worktree_config
+            .as_ref()
+            .expect("worktree config must be passed through to spawn");
+        assert_eq!(cfg.source_repo, PathBuf::from("/tmp/repo"));
+        assert!(cfg.branch.is_none(), "branch is auto-generated downstream");
+        assert!(
+            cfg.base_ref.is_none(),
+            "base_ref defaults to HEAD downstream"
+        );
+        assert_eq!(cfg.label_hint, "Auth Refactor");
+    }
+
+    #[test]
+    fn spawn_in_tile_skips_worktree_config_when_worktree_mode_off() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let ws_id = state.active_workspace;
+        // Repo is set but worktree mode is not: a plain shell is wanted.
+        state.workspace_mut(ws_id).unwrap().project_repo = Some(PathBuf::from("/tmp/repo"));
+        let tile_id = state.active_workspace().tiles[0].id;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SpawnInTile {
+                tile_id,
+                worktree: None,
+            },
+        );
+        assert!(pty.last_spawn_worktree_config.is_none());
+    }
+
+    #[test]
+    fn spawn_in_tile_skips_worktree_config_when_no_project_repo() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let ws_id = state.active_workspace;
+        // worktree_mode is true but project_repo is None — apply_action
+        // refuses to invent a repo, so no config goes to spawn.
+        state.workspace_mut(ws_id).unwrap().worktree_mode = true;
+        let tile_id = state.active_workspace().tiles[0].id;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SpawnInTile {
+                tile_id,
+                worktree: None,
+            },
+        );
+        assert!(pty.last_spawn_worktree_config.is_none());
+    }
+
+    #[test]
+    fn spawn_in_tile_passes_explicit_worktree_config_through_unchanged() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let ws_id = state.active_workspace;
+        // Workspace has a different repo configured: an explicit config
+        // (e.g. via Fork) wins.
+        state.workspace_mut(ws_id).unwrap().project_repo =
+            Some(PathBuf::from("/tmp/workspace-repo"));
+        state.workspace_mut(ws_id).unwrap().worktree_mode = true;
+
+        let tile_id = state.active_workspace().tiles[0].id;
+        let explicit = crate::worktree::WorktreeConfig {
+            source_repo: PathBuf::from("/tmp/explicit-repo"),
+            branch: Some("feature/explicit".into()),
+            base_ref: Some("main".into()),
+            label_hint: "explicit".into(),
+        };
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SpawnInTile {
+                tile_id,
+                worktree: Some(explicit.clone()),
+            },
+        );
+        assert_eq!(pty.last_spawn_worktree_config.as_ref(), Some(&explicit));
+    }
+
+    #[test]
+    fn spawn_in_tile_passes_worktree_path_as_cwd_when_pty_returns_a_worktree() {
+        // Sanity: when the PTY layer reports back a created worktree,
+        // apply_action stores it on the tile but leaves the cwd plumbing
+        // to the PTY layer (which sets cwd = worktree_path before spawn).
+        // This test verifies the tile-side storage; the cwd-vs-worktree
+        // precedence lives in `git.rs::create_worktree`.
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty {
+            next_spawn_worktree: Some(crate::worktree::Worktree {
+                source_repo: PathBuf::from("/tmp/repo"),
+                worktree_path: PathBuf::from("/tmp/wt-out"),
+                branch: "kookaburra/whatever-1234".into(),
+                base_ref: "HEAD".into(),
+                status: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let ws_id = state.active_workspace;
+        state.workspace_mut(ws_id).unwrap().project_repo = Some(PathBuf::from("/tmp/repo"));
+        state.workspace_mut(ws_id).unwrap().worktree_mode = true;
+        let tile_id = state.active_workspace().tiles[0].id;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SpawnInTile {
+                tile_id,
+                worktree: None,
+            },
+        );
+        let stored = state.tile(tile_id).unwrap().worktree.as_ref().unwrap();
+        assert_eq!(stored.worktree_path, PathBuf::from("/tmp/wt-out"));
+        assert_eq!(stored.branch, "kookaburra/whatever-1234");
+    }
+
+    #[test]
+    fn spawn_in_tile_stores_worktree_metadata_returned_by_pty() {
+        // The spawn callback decides the actual worktree path/branch (it
+        // shells out to `git worktree add`). apply_action just stores the
+        // returned metadata on the freshly promoted tile.
+        let returned = crate::worktree::Worktree {
+            source_repo: std::path::PathBuf::from("/tmp/repo"),
+            worktree_path: std::path::PathBuf::from("/tmp/wt"),
+            branch: "kookaburra/scratch-abcd".into(),
+            base_ref: "HEAD".into(),
+            status: Default::default(),
+        };
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty {
+            next_spawn_worktree: Some(returned.clone()),
+            ..Default::default()
+        };
+        let tile_id = state.active_workspace().tiles[0].id;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SpawnInTile {
+                tile_id,
+                worktree: Some(crate::worktree::WorktreeConfig {
+                    source_repo: std::path::PathBuf::from("/tmp/repo"),
+                    branch: None,
+                    base_ref: None,
+                    label_hint: "scratch".into(),
+                }),
+            },
+        );
+        assert_eq!(
+            state.tile(tile_id).unwrap().worktree.as_ref(),
+            Some(&returned)
+        );
+    }
+
+    #[test]
+    fn set_worktree_mode_turns_flag_on() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let ws_id = state.active_workspace;
+        // Worktree mode requires a detected repo.
+        state.workspace_mut(ws_id).unwrap().project_repo = Some(PathBuf::from("/tmp/repo"));
+        assert!(!state.workspace(ws_id).unwrap().worktree_mode);
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SetWorktreeMode {
+                id: ws_id,
+                on: true,
+            },
+        );
+        assert!(state.workspace(ws_id).unwrap().worktree_mode);
+    }
+
+    #[test]
+    fn set_worktree_mode_turns_flag_off() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let ws_id = state.active_workspace;
+        state.workspace_mut(ws_id).unwrap().worktree_mode = true;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SetWorktreeMode {
+                id: ws_id,
+                on: false,
+            },
+        );
+        assert!(!state.workspace(ws_id).unwrap().worktree_mode);
+    }
+
+    #[test]
+    fn set_worktree_mode_on_unknown_workspace_is_noop() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SetWorktreeMode {
+                id: WorkspaceId::new(),
+                on: true,
+            },
+        );
+        // Original workspace untouched.
+        assert!(!state.active_workspace().worktree_mode);
+    }
+
+    #[test]
+    fn set_worktree_mode_refused_when_no_project_repo() {
+        // Guardrail: even if the UI somehow asks for worktree mode on a
+        // workspace whose default_cwd isn't inside a repo, apply_action
+        // refuses. (The UI is expected to disable the toggle in that
+        // case, but state is authoritative.)
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let ws_id = state.active_workspace;
+        assert!(state.workspace(ws_id).unwrap().project_repo.is_none());
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SetWorktreeMode {
+                id: ws_id,
+                on: true,
+            },
+        );
+        assert!(!state.workspace(ws_id).unwrap().worktree_mode);
+    }
+
+    #[test]
+    fn set_workspace_cwd_caches_project_repo_when_in_repo() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty {
+            repo_root_for_next_lookup: Some(PathBuf::from("/tmp/repo")),
+            ..Default::default()
+        };
+        let ws_id = state.active_workspace;
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SetWorkspaceCwd {
+                id: ws_id,
+                cwd: Some(PathBuf::from("/tmp/repo/sub/dir")),
+            },
+        );
+        assert_eq!(
+            state.workspace(ws_id).unwrap().project_repo.as_deref(),
+            Some(Path::new("/tmp/repo"))
+        );
+    }
+
+    #[test]
+    fn set_workspace_cwd_clears_project_repo_when_not_in_repo() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        // No repo_root_for_next_lookup set — `resolve_repo_root` returns None.
+        let ws_id = state.active_workspace;
+        state.workspace_mut(ws_id).unwrap().project_repo = Some(PathBuf::from("/tmp/old-repo"));
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SetWorkspaceCwd {
+                id: ws_id,
+                cwd: Some(PathBuf::from("/tmp/elsewhere")),
+            },
+        );
+        assert!(state.workspace(ws_id).unwrap().project_repo.is_none());
+    }
+
+    #[test]
+    fn set_workspace_cwd_to_none_clears_project_repo_and_worktree_mode() {
+        let mut state = AppState::new(Config::default());
+        let mut pty = StubPty::default();
+        let ws_id = state.active_workspace;
+        {
+            let ws = state.workspace_mut(ws_id).unwrap();
+            ws.default_cwd = Some(PathBuf::from("/tmp/repo"));
+            ws.project_repo = Some(PathBuf::from("/tmp/repo"));
+            ws.worktree_mode = true;
+        }
+        apply_action(
+            &mut state,
+            &mut pty,
+            Action::SetWorkspaceCwd {
+                id: ws_id,
+                cwd: None,
+            },
+        );
+        let ws = state.workspace(ws_id).unwrap();
+        assert!(ws.default_cwd.is_none());
+        assert!(ws.project_repo.is_none());
+        assert!(
+            !ws.worktree_mode,
+            "worktree_mode auto-clears when project_repo goes away"
+        );
     }
 
     #[test]

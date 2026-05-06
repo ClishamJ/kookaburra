@@ -43,4 +43,9 @@ pub struct WorktreeConfig {
     pub branch: Option<String>,
     /// Base ref. None means HEAD.
     pub base_ref: Option<String>,
+    /// Hint used when `branch` is `None` to assemble the auto-generated
+    /// branch name. Typically the workspace label so users can recognize
+    /// branches like `kookaburra/auth-refactor-3f9a`. May be empty; the
+    /// implementation falls back to a default in that case.
+    pub label_hint: String,
 }

@@ -137,19 +137,26 @@ Checklist mirrors §8 of the spec. Tick items as they land. Sub-items that aren'
 
 ### Phase 6 — Worktrees
 
-- [ ] `kookaburra-core::worktree` implementation
-- [ ] New-tile dialog with worktree toggle (disabled when cwd isn't a repo)
-- [ ] Branch name + base-ref prompt (dropdown from `git branch -a`)
-- [ ] `git worktree add <path> -b <branch> <base>` via subprocess
-- [ ] Short random suffix in auto-generated branch names
-- [ ] PTY spawn with CWD = worktree path
+**Design pivot from spec §4:** the spec called for a per-tile new-tile dialog (label + branch + base-ref prompts on every spawn). We replaced it with a **workspace-level worktree-mode toggle**: each workspace declares a project (its `default_cwd` + auto-detected `project_repo`) and a `worktree_mode: bool`. While the flag is on, every `SpawnInTile` in that workspace auto-creates a fresh worktree (auto-named branch, base = HEAD) — turning "6 worktrees per tab" into 6 keypresses on empty slots instead of 6 dialogs. Cleanup-on-close defaults to **auto-keep** (worktrees accumulate; user cleans up later via the orphan-scan path or by hand). The per-tile dialog model is parked indefinitely — fork it back if a future workflow needs explicit branch naming.
+
+- [x] `kookaburra-core::worktree` implementation — `Worktree`, `WorktreeConfig`, `WorktreeStatus` data shapes finalized; `WorktreeConfig` gained `label_hint` so the PTY layer can compose auto-generated branch names without a slug round-trip. The git subprocess work itself lives in `kookaburra-app::git`, called via the `PtySideEffects` trait.
+- [~] New-tile dialog with worktree toggle (disabled when cwd isn't a repo) — pivoted to a workspace-card editor (label + cwd + worktree-mode toggle). Toggle is greyed with a tooltip when `default_cwd` isn't inside a git repo. Per-tile dialog is parked.
+- [~] Branch name + base-ref prompt (dropdown from `git branch -a`) — pivoted: branches auto-generate from `kookaburra/<workspace-slug>-<short_id>`, base = HEAD. No interactive prompt.
+- [x] `git worktree add <path> -b <branch> <base>` via subprocess — `kookaburra-app::git::create_worktree` shells out to `git`; on failure, `PtyAdapter::spawn` falls back to a plain shell at the workspace cwd and logs the error.
+- [x] Short random suffix in auto-generated branch names — 4-char hex from `(SystemTime::nanos × prime) ⊕ AtomicCounter`. Not crypto-random; just enough to dodge collisions on rapid grid fill. `git worktree add -b` will refuse a duplicate if one slips through.
+- [x] PTY spawn with CWD = worktree path — `PtyAdapter::spawn` sets `SpawnRequest.cwd` to the freshly created worktree directory whenever a worktree was successfully created. Plain spawns keep using the workspace's `default_cwd`.
 - [ ] `git status --porcelain=v2 --branch` poll every 2–3s
-- [ ] Branch + dirty indicator on tile + strip card
-- [ ] Close-tile cleanup prompt: Keep / Remove / Copy-branch-and-remove
-- [ ] Loud warning on dirty close; default Keep; force-remove needs confirm
+- [~] Branch + dirty indicator on tile + strip card — branch surfaces in the tile header via `Tile::display_title()` (`⎇ <branch> · <shell-title>`); cards show a small `⎇` marker when `worktree_mode` is on. Dirty-status polling is the unticked sibling above.
+- [ ] Close-tile cleanup prompt: Keep / Remove / Copy-branch-and-remove — superseded by user choice of "auto-keep". CloseTile no longer touches the worktree directory.
+- [ ] Loud warning on dirty close; default Keep; force-remove needs confirm — N/A under auto-keep.
 - [ ] Orphan scan on startup (`git worktree list`) → cleanup offer, never auto-delete
 - [ ] `Action::ForkTile` — new tile with new worktree branched from same base
 - [ ] Document submodule + hooks caveats in README
+
+Other worktree-adjacent work landed in this slice:
+- [x] `Workspace::default_cwd` is now editable from the strip card (label + cwd + worktree-mode in one popover editor; `~/...` expanded against `$HOME`).
+- [x] `Action::SetWorkspaceCwd` and `Action::SetWorktreeMode` added; `apply_action::SetWorkspaceCwd` calls `PtySideEffects::resolve_repo_root` to refresh the cached `project_repo`, and clears `worktree_mode` if the new cwd isn't inside a repo.
+- [x] `PtySideEffects::spawn` returns `SpawnResult { pty_id, worktree }` so `apply_action` can attach the freshly created worktree's metadata to the promoted tile.
 
 ### Phase 7 — Cross-tile and templates
 
